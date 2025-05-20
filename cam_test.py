@@ -411,16 +411,23 @@ def main():
     # 비디오 소스 설정
     try:
         if args.source.isdigit():
-            print(f"웹캠 {args.source}을(를) 사용합니다.")
-            cap = cv2.VideoCapture(int(args.source))
+            print(f"웹캠 /dev/video{args.source}을(를) USB 모드로 사용합니다.")
+            # ASSIGN CAMERA ADDRESS HERE - /dev/videoX (X=0, 1, 2...)
+            camera_id = f"/dev/video{args.source}"
+            # Full list of Video Capture APIs (video backends): https://docs.opencv.org/3.4/d4/d15/group__videoio__flags__base.html
+            # For webcams, we use V4L2
+            cap = cv2.VideoCapture(camera_id, cv2.CAP_V4L2) # Use V4L2 backend for USB cameras
+
         else:
             print(f"비디오 파일 {args.source}을(를) 사용합니다.")
             cap = cv2.VideoCapture(args.source)
-        
+
         # 해상도 설정
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
-        
+        # FPS 설정 (선택 사항, 일부 카메라는 지원하지 않을 수 있습니다)
+        # cap.set(cv2.CAP_PROP_FPS, DEFAULT_CAMERA_FPS)
+
         if not cap.isOpened():
             raise ValueError("비디오 소스를 열 수 없습니다.")
             
