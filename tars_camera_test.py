@@ -6,9 +6,9 @@ from ultralytics import YOLO
 from jetcam.csi_camera import CSICamera
 from tars_config import get_roi_slice, LANE_WIDTH_PX, CAMERA_WIDTH, CAMERA_HEIGHT, CAMERA_FPS
 
-def get_roi_slice(H_img):
-    y0 = H_img // 2 
-    return slice(y0, H_img)
+# def get_roi_slice(H_img):
+#     y0 = H_img // 2 
+#     return slice(y0, H_img)
     
 class LaneCenterTracker:
 
@@ -57,7 +57,7 @@ class LaneCenterTracker:
         """
         r = results
         H_img, W_img = r.orig_shape[:2]
-        roi = get_roi_slice(H_img)
+        roi = roi or get_roi_slice(H_img)  # 설정 모듈의 함수 사용
         
         if r.masks is None or len(r.masks.data) == 0:     # CASE 0
             return self.center_px                         # 그대로 유지
@@ -188,9 +188,10 @@ def main():
     model.fuse()
 
     print("Initializing camera...")
-    WIDTH, HEIGHT = 1280, 720
-    FPS = 30
-    camera = CSICamera(width=WIDTH, height=HEIGHT, capture_fps=FPS)
+    # WIDTH, HEIGHT = 1280, 720
+    # FPS = 30
+    # camera = CSICamera(width=WIDTH, height=HEIGHT, capture_fps=FPS)
+    camera = CSICamera(width=CAMERA_WIDTH, height=CAMERA_HEIGHT, capture_fps=CAMERA_FPS)
     camera.running = True
 
     print("Waiting for camera to be ready...")
