@@ -17,6 +17,7 @@ import sys
 import pygame
 from tars_manual_ctrl import PygameKeyboardController
 from tars_manual_ctrl import TerminalKeyboardController
+import pathlib
 
 # 베이스 컨트롤러 초기화
 available_ports = glob.glob('/dev/ttyUSB*')
@@ -160,18 +161,25 @@ def capture_photo():
     print("카메라 준비 중...")
     time.sleep(1)
     
+    # Add directory creation logic
+    OUTDIR = "./captures"
+    path = pathlib.Path(OUTDIR).resolve()
+    path.mkdir(exist_ok=True, parents=True)
+
     timestamp = time.strftime("%Y%m%d_%H%M%S")
-    file_path = f"capture_{timestamp}.jpg"
-    
+    # Update file_path to include the directory
+    file_path = str(path / f"capture_{timestamp}.jpg")
+
     frame = camera_manager.get_frame()
     if frame is not None:
         cv2.imwrite(file_path, frame)
         print(f"✅ 이미지가 저장되었습니다: {file_path}")
-        
-        cv2.imshow("Captured Image", frame)
-        print("아무 키나 눌러 계속하세요...")
-        cv2.waitKey(0)
-        cv2.destroyAllWindows()
+
+        # Remove imshow and related calls
+        # cv2.imshow("Captured Image", frame)
+        # print("아무 키나 눌러 계속하세요...")
+        # cv2.waitKey(0)
+        # cv2.destroyAllWindows()
     else:
         print("❌ 프레임을 캡쳐할 수 없습니다.")
     
