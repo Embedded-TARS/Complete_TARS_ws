@@ -60,7 +60,7 @@ def main():
             # Perception: YOLO 추론 및 차선 감지
             results = lane_model.predict(frame)
             lane_center_x = perception.update(results[0], roi = roi)
-            print(lane_center_x)
+            print(f"lane_center_x : {lane_center_x}")
 
             # Planning: 속도 및 스티어링 결정
             linear_speed, steering, deviation = planner.plan(lane_center_x, img_center_x)
@@ -72,7 +72,7 @@ def main():
             frame_with_lanes = perception.visualize_lanes(frame, deviation, steering, roi)
             
             # 결과 이미지 출력
-            cv2.imshow("YOLO-AutoDrive", frame_with_lanes)
+            # cv2.imshow("YOLO-AutoDrive", frame_with_lanes)
 
             # 키 입력 처리
             key = cv2.waitKey(1) & 0xFF

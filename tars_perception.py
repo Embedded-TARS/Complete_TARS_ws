@@ -288,6 +288,8 @@ class LanePerception:
         elif self.left_coef is None and self.right_coef is None:
             lane_status = "Lane not detected"
             
+        print(f"Lane Status: {lane_status}")
+
         cv2.putText(frame_with_lanes, lane_status, 
                     (10, frame.shape[0] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, self.lane_status_color, 2)
         
