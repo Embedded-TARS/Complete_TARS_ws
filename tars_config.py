@@ -6,7 +6,7 @@ TARS 로봇 시스템의 전역 설정값을 관리하는 모듈
 
 # 카메라 설정
 CAMERA_WIDTH = 640
-CAMERA_HEIGHT = 480
+CAMERA_HEIGHT = 360
 CAMERA_FPS = 30
 
 # 차선 인식 설정

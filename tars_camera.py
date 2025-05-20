@@ -35,9 +35,9 @@ class CameraManager:
             self._camera = cv2.VideoCapture(camera_id, cv2.CAP_V4L2)
             
             # Optionally set properties (uncomment if needed)
-            # self._camera.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-            # self._camera.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-            # self._camera.set(cv2.CAP_PROP_FPS, capture_fps)
+            self._camera.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+            self._camera.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+            self._camera.set(cv2.CAP_PROP_FPS, capture_fps)
             
             # 카메라가 프레임을 읽을 준비가 될 때까지 대기
             print("카메라가 준비될 때까지 대기 중...")

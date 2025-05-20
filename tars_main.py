@@ -87,7 +87,7 @@ def main():
             frame_with_lanes = perception.visualize_lanes(frame, deviation, steering, roi)
             
             # 결과 이미지 출력
-            # cv2.imshow("YOLO-AutoDrive", frame_with_lanes)
+            cv2.imshow("YOLO-AutoDrive", frame_with_lanes)
 
             # 키 입력 처리
             key = cv2.waitKey(1) & 0xFF
