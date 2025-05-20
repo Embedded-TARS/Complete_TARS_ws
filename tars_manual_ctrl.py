@@ -303,7 +303,7 @@ class TerminalKeyboardController(BaseManualController):
         self._input_thread.start()
 
         try:
-            cv2.namedWindow("Camera Feed", cv2.WINDOW_AUTOSIZE) # Create OpenCV window
+            # cv2.namedWindow("Camera Feed", cv2.WINDOW_AUTOSIZE) # Create OpenCV window
 
             self.print_status() # Initial status
             while self.running:
@@ -325,7 +325,7 @@ class TerminalKeyboardController(BaseManualController):
                 if self.is_recording and self.camera_manager is not None:
                     frame = self.camera_manager.get_frame()
                     if frame is not None:
-                        cv2.imshow("Camera Feed", frame) # Display the frame
+                        # cv2.imshow("Camera Feed", frame) # Display the frame
                         cv2.waitKey(1) # Process OpenCV window events
                         self.video_writer.write(frame)
 
