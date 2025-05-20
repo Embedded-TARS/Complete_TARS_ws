@@ -54,9 +54,13 @@ def main():
             # 이미지 중앙 x 좌표 계산
             img_center_x = (frame.shape[1] // 2) - 11
 
+            y = frame.shape[0]
+            roi = slice(y * 3 // 4, y)
+
             # Perception: YOLO 추론 및 차선 감지
             results = lane_model.predict(frame)
-            lane_center_x = perception.update(results[0])
+            lane_center_x = perception.update(results[0], roi = roi)
+            print(lane_center_x)
 
             # Planning: 속도 및 스티어링 결정
             linear_speed, steering, deviation = planner.plan(lane_center_x, img_center_x)
