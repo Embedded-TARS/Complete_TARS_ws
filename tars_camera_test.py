@@ -4,6 +4,7 @@ import torch
 import numpy as np
 from ultralytics import YOLO
 from jetcam.csi_camera import CSICamera
+from tars_config import get_roi_slice, LANE_WIDTH_PX, CAMERA_WIDTH, CAMERA_HEIGHT, CAMERA_FPS
 
 def get_roi_slice(H_img):
     y0 = H_img // 2 
@@ -11,12 +12,22 @@ def get_roi_slice(H_img):
     
 class LaneCenterTracker:
 
-    def __init__(self, lane_width_px: float, poly_deg: int = 2):
-        self.lane_width_px = lane_width_px      # 고정 차로 폭(픽셀)
+    # def __init__(self, lane_width_px: float, poly_deg: int = 2):
+    #     self.lane_width_px = lane_width_px      # 고정 차로 폭(픽셀)
+    #     self.poly_deg = poly_deg
+    #     self.left_coef  = None                  # np.ndarray | None
+    #     self.right_coef = None
+    #     self.center_px  = None                  # float | None
+    #     self.left_y_range = None
+    #     self.right_y_range = None
+    
+    def __init__(self, lane_width_px: float = LANE_WIDTH_PX, poly_deg: int = 2):
+        # lane_width_px 기본값을 tars_config.py의 값으로 설정
+        self.lane_width_px = lane_width_px
         self.poly_deg = poly_deg
-        self.left_coef  = None                  # np.ndarray | None
+        self.left_coef  = None
         self.right_coef = None
-        self.center_px  = None                  # float | None
+        self.center_px  = None
         self.left_y_range = None
         self.right_y_range = None
 
@@ -188,7 +199,8 @@ def main():
     print("✅ Camera ready!")
 
     prev_t = time.time()
-    tracker = LaneCenterTracker(lane_width_px=700, poly_deg=1)
+    # tracker = LaneCenterTracker(lane_width_px=700, poly_deg=1)
+    tracker = LaneCenterTracker(lane_width_px=LANE_WIDTH_PX, poly_deg=POLY_DEG)
     while True:
         frame = camera.value
 
@@ -197,7 +209,8 @@ def main():
             continue
 
         H_img, W_img = frame.shape[:2]
-        roi = slice(H_img // 2, H_img)
+        # roi = slice(H_img // 2, H_img)
+        roi = get_roi_slice(H_img)  # 설정 모듈의 함수 사용
         # 3-A) YOLO 추론
         results = model.predict(frame, device = device)
 

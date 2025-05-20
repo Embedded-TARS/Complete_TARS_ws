@@ -3,6 +3,7 @@
 from jetcam.csi_camera import CSICamera
 import time
 import cv2
+from tars_config import CAMERA_WIDTH, CAMERA_HEIGHT, CAMERA_FPS
 
 class CameraManager:
     """
@@ -21,7 +22,8 @@ class CameraManager:
             cls._instance = CameraManager()
         return cls._instance
     
-    def initialize_camera(self, width=640, height=480, capture_fps=30):
+    # def initialize_camera(self, width=640, height=480, capture_fps=30):
+    def initialize_camera(self, width=CAMERA_WIDTH, height=CAMERA_HEIGHT, capture_fps=CAMERA_FPS):
         """카메라를 초기화합니다. 이미 초기화된 경우 참조 카운트만 증가합니다."""
         if not self._is_initialized:
             print("카메라 초기화 중...")

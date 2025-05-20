@@ -18,6 +18,10 @@ import pygame
 from tars_manual_ctrl import PygameKeyboardController
 from tars_manual_ctrl import TerminalKeyboardController
 import pathlib
+from tars_config import (  # 설정 모듈 임포트
+    get_roi_slice, CAMERA_WIDTH, CAMERA_HEIGHT, CAMERA_FPS, 
+    LANE_WIDTH_PX, EMA_ALPHA, CAPTURE_DIR
+)
 
 # 베이스 컨트롤러 초기화
 available_ports = glob.glob('/dev/ttyUSB*')
@@ -32,14 +36,24 @@ else:
 base = BaseController(port, 115200)
 
 # 자율주행 메인 루프
+# def main():
+#     # 자율주행 모듈 및 카메라 초기화
+#     lane_model = LaneDetectionModel(model_path="lane.pt", lane_class_id=12)
+#     perception = LanePerception(lane_width_px=700, ema_alpha=0.8)
+#     planner = LanePlanner()
+#     controller = RobotController(base)
+#     camera_manager = CameraManager.get_instance()
+#     camera_manager.initialize_camera(width=640, height=480, capture_fps=30)
+#
+
 def main():
     # 자율주행 모듈 및 카메라 초기화
     lane_model = LaneDetectionModel(model_path="lane.pt", lane_class_id=12)
-    perception = LanePerception(lane_width_px=700, ema_alpha=0.8)
+    perception = LanePerception(lane_width_px=LANE_WIDTH_PX, ema_alpha=EMA_ALPHA)
     planner = LanePlanner()
     controller = RobotController(base)
     camera_manager = CameraManager.get_instance()
-    camera_manager.initialize_camera(width=640, height=480, capture_fps=30)
+    camera_manager.initialize_camera(width=CAMERA_WIDTH, height=CAMERA_HEIGHT, capture_fps=CAMERA_FPS)
 
     print("🚗 자율주행 모드 시작 - q 키를 눌러 종료")
     
@@ -54,8 +68,9 @@ def main():
             # 이미지 중앙 x 좌표 계산
             img_center_x = (frame.shape[1] // 2) - 11
 
-            y = frame.shape[0]
-            roi = slice(y * 2 // 4, y)
+            # y = frame.shape[0]
+            # roi = slice(y * 2 // 4, y)
+            roi = get_roi_slice(frame.shape[0]) 
 
             # Perception: YOLO 추론 및 차선 감지
             results = lane_model.predict(frame)

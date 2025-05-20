@@ -1,15 +1,21 @@
 # 02_tars_planning.py
 
 import numpy as np
+from tars_config import MAX_STEER, MAX_SPEED, MIN_SPEED, STRAIGHT_SPEED, TURN_THRESHOLD
 
 class LanePlanner:
     def __init__(self):
-        self.MAX_STEER = 0.5
-        self.MAX_SPEED = 0.5
-        self.MIN_SPEED = 0.5
-        self.STRAIGHT_SPEED = 0.33
-        self.TURN_THRESHOLD = 0.15
+        # self.MAX_STEER = 0.5
+        # self.MAX_SPEED = 0.5
+        # self.MIN_SPEED = 0.5
+        # self.STRAIGHT_SPEED = 0.33
+        # self.TURN_THRESHOLD = 0.15
         # self.DEFAULT_LANE_WIDTH = 700  # This is no longer needed
+        self.MAX_STEER = MAX_STEER
+        self.MAX_SPEED = MAX_SPEED
+        self.MIN_SPEED = MIN_SPEED
+        self.STRAIGHT_SPEED = STRAIGHT_SPEED
+        self.TURN_THRESHOLD = TURN_THRESHOLD
 
     # Modified plan method to accept the single lane center x coordinate and image center x coordinate
     # It will now calculate the deviation based on these two points.

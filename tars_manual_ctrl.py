@@ -7,25 +7,30 @@ import threading
 import pathlib # Import pathlib
 import cv2 # Import cv2
 from tars_camera import CameraManager  # 변경된 부분: CameraManager 사용
+from tars_config import CAMERA_WIDTH, CAMERA_HEIGHT, CAMERA_FPS, VIDEO_DIR, MAX_STEER, MAX_SPEED, STEP_STEER, STEP_SPEED, UPDATE_INTERVAL
 
 from base_ctrl_js import BaseController
 
 # Video Capture Configuration
-OUTDIR = "./videos"
-WIDTH, HEIGHT = 640, 480
-FPS = 30
+# OUTDIR = "./videos"
+OUTDIR = VIDEO_DIR
+# WIDTH, HEIGHT = 640, 480
+# FPS = 30
 
 class BaseManualController:
     def __init__(self, base):
+        # super().__init__(base) 호출을 제거 (오류의 원인)
+        
+        # 기존 하드코딩된 값 대신 tars_config에서 임포트한 값 사용
         self.base = base
         self.running = True
         self.linear_speed = 0.0
         self.angular_speed = 0.0
-        self.MAX_STEER = 0.5
-        self.MAX_SPEED = 0.5
-        self.STEP_STEER = 0.05 # Smaller steps for smoother control
-        self.STEP_SPEED = 0.02
-        self.UPDATE_INTERVAL = 0.05
+        self.MAX_STEER = MAX_STEER  # tars_config에서 임포트한 값 사용
+        self.MAX_SPEED = MAX_SPEED  # tars_config에서 임포트한 값 사용
+        self.STEP_STEER = STEP_STEER  # tars_config에서 임포트한 값 사용
+        self.STEP_SPEED = STEP_SPEED  # tars_config에서 임포트한 값 사용
+        self.UPDATE_INTERVAL = UPDATE_INTERVAL  # tars_config에서 임포트한 값 사용
         self.light_on = False
         self.last_update_time = time.time()
 
@@ -243,8 +248,12 @@ class TerminalKeyboardController(BaseManualController):
             print(f"\n카메라 초기화 중 - 녹화 파일: {self.video_filepath}...")
             
             # CameraManager를 통해 카메라 초기화
+            # self.camera_manager = CameraManager.get_instance()
+            # camera = self.camera_manager.initialize_camera(width=WIDTH, height=HEIGHT, capture_fps=FPS)
             self.camera_manager = CameraManager.get_instance()
-            camera = self.camera_manager.initialize_camera(width=WIDTH, height=HEIGHT, capture_fps=FPS)
+            camera = self.camera_manager.initialize_camera(
+                width=CAMERA_WIDTH, height=CAMERA_HEIGHT, capture_fps=CAMERA_FPS
+            )
 
             fourcc = cv2.VideoWriter_fourcc(*'mp4v')
             self.video_writer = cv2.VideoWriter(self.video_filepath, fourcc, FPS, (WIDTH, HEIGHT))

@@ -7,6 +7,7 @@ from ultralytics import YOLO
 import torch
 import time
 import numpy as np
+from tars_config import get_roi_slice, LANE_WIDTH_PX, POLY_DEG, EMA_ALPHA
 
 class LaneDetectionModel:
     """차선 감지를 위한 YOLO 모델을 로드하고 관리합니다."""
@@ -22,9 +23,9 @@ class LaneDetectionModel:
         return self.model.predict(frame, device=self.device, conf=0.5, iou=0.45)
 
 # 이미지 하단 절반을 ROI (관심 영역)로 설정하는 함수
-def get_roi_slice(H_img):
-    y0 = int(H_img * 3 / 4)
-    return slice(y0, H_img)
+# def get_roi_slice(H_img):
+#     y0 = int(H_img * 3 / 4)
+#     return slice(y0, H_img)
 
 # 다항식 계수를 이용하여 이미지에 차선을 그리는 함수
 def draw_polyline(img, coef, color, thickness=5, n_pts=50, y_range_roi=None, roi_offset_y=0):
@@ -62,8 +63,14 @@ def draw_polyline(img, coef, color, thickness=5, n_pts=50, y_range_roi=None, roi
 class LanePerception:
     """차선 중앙을 추적하고 필요에 따라 EMA(지수 이동 평균)로 스무딩합니다."""
     
-    def __init__(self, *, lane_width_px: float, ema_alpha: Optional[float] = 0.5,
-                 poly_deg: Optional[int] = 2):
+    # def __init__(self, *, lane_width_px: float, ema_alpha: Optional[float] = 0.5,
+    #              poly_deg: Optional[int] = 2):
+        # self.lane_width_px = lane_width_px
+        # self.ema_alpha = ema_alpha
+        # self.poly_deg = poly_deg
+    def __init__(self, *, lane_width_px: float = LANE_WIDTH_PX, 
+                 ema_alpha: Optional[float] = EMA_ALPHA,
+                 poly_deg: Optional[int] = POLY_DEG):
         self.lane_width_px = lane_width_px
         self.ema_alpha = ema_alpha
         self.poly_deg = poly_deg

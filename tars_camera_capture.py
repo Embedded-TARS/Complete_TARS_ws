@@ -2,11 +2,15 @@ import cv2
 import time
 import pathlib
 from jetcam.csi_camera import CSICamera
+from tars_config import CAMERA_WIDTH, CAMERA_HEIGHT, CAMERA_FPS, CAPTURE_DIR
 
 # Configuration
-OUTDIR = "./captures"
-WIDTH, HEIGHT = 640, 480 # Change camera resolution to 640x480
-FPS = 30 # Not strictly needed for single capture but good practice
+# OUTDIR = "./captures"
+# WIDTH, HEIGHT = 640, 480 # Change camera resolution to 640x480
+# FPS = 30 # Not strictly needed for single capture but good practice
+OUTDIR = CAPTURE_DIR
+WIDTH, HEIGHT = CAMERA_WIDTH, CAMERA_HEIGHT
+FPS = CAMERA_FPS
 
 def main():
     timestamp = time.strftime('%Y%m%d_%H%M%S')
