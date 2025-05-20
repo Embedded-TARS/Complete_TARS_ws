@@ -1,4 +1,4 @@
 # TARS - Embedded Project
-> Contributed by
+> Contributed by  
 ** Jisang, Joonhyong, Seonghyun **
 
