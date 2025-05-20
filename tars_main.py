@@ -55,7 +55,7 @@ def main():
             img_center_x = (frame.shape[1] // 2) - 11
 
             y = frame.shape[0]
-            roi = slice(y * 3 // 4, y)
+            roi = slice(y * 2 // 4, y)
 
             # Perception: YOLO 추론 및 차선 감지
             results = lane_model.predict(frame)
@@ -69,7 +69,7 @@ def main():
             controller.send_control(linear_speed, steering)
 
             # 차선 인식 시각화를 위해 perception 모듈에 위임
-            frame_with_lanes = perception.visualize_lanes(frame, deviation, steering)
+            frame_with_lanes = perception.visualize_lanes(frame, deviation, steering, roi)
             
             # 결과 이미지 출력
             cv2.imshow("YOLO-AutoDrive", frame_with_lanes)

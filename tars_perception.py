@@ -124,6 +124,12 @@ class LanePerception:
             ys, xs = np.nonzero(mask_bin)
             if xs.size < self.poly_deg + 1:
                 return None
+
+            # Add check for unique y-coordinates
+            if np.unique(ys).size < self.poly_deg + 1:
+                # print(f"Debug: Not enough unique y-coordinates for polyfit (needed: {self.poly_deg + 1}, got: {np.unique(ys).size})") # Optional debug print
+                return None
+
             return np.polyfit(ys, xs, self.poly_deg)
 
         # 두 개의 가장 큰 마스크를 차선으로 시도
@@ -204,7 +210,7 @@ class LanePerception:
         return self.center_px
     
     # 차선 인식 시각화 함수 추가
-    def visualize_lanes(self, frame, deviation=0.0, steering=0.0):
+    def visualize_lanes(self, frame, deviation=0.0, steering=0.0, roi=None):
         """
         차선 인식 결과를 시각화합니다.
         
@@ -224,6 +230,8 @@ class LanePerception:
         """
         # 원본 프레임 복사
         frame_with_lanes = frame.copy()
+
+        y_offset = roi.start or 0
         
         # 왼쪽 차선 그리기
         if self.left_coef is not None and self.left_mask is not None:
@@ -232,7 +240,8 @@ class LanePerception:
                 self.left_coef, 
                 self.left_mask, 
                 (0, 255, 0),  # 녹색
-                thickness=3
+                thickness=3,
+                y_offset=y_offset
             )
         
         # 오른쪽 차선 그리기
@@ -242,7 +251,8 @@ class LanePerception:
                 self.right_coef, 
                 self.right_mask, 
                 (0, 0, 255),  # 빨간색
-                thickness=3
+                thickness=3,
+                y_offset=y_offset
             )
         
         # 차선 중앙 표시 (인식된 경우)
@@ -269,14 +279,14 @@ class LanePerception:
         cv2.putText(frame_with_lanes, f"{self.fps:.1f} FPS", 
                     (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1.0, self.fps_color, 2)
         
-        # 차선 상태 표시
-        lane_status = "양쪽 차선 감지"
+        # Lane status display
+        lane_status = "Both lanes detected"
         if self.left_coef is not None and self.right_coef is None:
-            lane_status = "왼쪽 차선만 감지"
+            lane_status = "Only left lane detected"
         elif self.left_coef is None and self.right_coef is not None:
-            lane_status = "오른쪽 차선만 감지"
+            lane_status = "Only right lane detected"
         elif self.left_coef is None and self.right_coef is None:
-            lane_status = "차선 미감지"
+            lane_status = "Lane not detected"
             
         cv2.putText(frame_with_lanes, lane_status, 
                     (10, frame.shape[0] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, self.lane_status_color, 2)
@@ -290,7 +300,8 @@ def draw_polyline_masked(img: np.ndarray,
                          color: Tuple[int, int, int],
                          *,
                          n_pts: int = 50,
-                         thickness: int = 3) -> None:
+                         thickness: int = 3,
+                         y_offset=0) -> None:
     if coef is None or mask_bin is None:
         return
         
@@ -302,7 +313,7 @@ def draw_polyline_masked(img: np.ndarray,
         
     ys = np.linspace(valid_rows.min(), valid_rows.max(), n_pts)
     xs = np.polyval(coef, ys)
-    pts = np.stack([xs, ys], axis=-1)
+    pts = np.stack([xs, ys + y_offset], axis=-1)
     
     in_img = (pts[:, 0] >= 0) & (pts[:, 0] < W)
     pts = pts[in_img]
