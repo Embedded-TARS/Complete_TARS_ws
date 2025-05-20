@@ -186,7 +186,12 @@ class BaseController:
             if self.virtual_mode:
                 print(f"가상 명령 처리: {data}")
             else:
-                self.ser.write((json.dumps(data) + '\n').encode("utf-8"))
+                try:
+                    self.ser.write((json.dumps(data) + '\n').encode("utf-8"))
+                except serial.serialutil.SerialException as e:
+                    print(f"[process_commands] Serial write failed: {e}")
+                    # Depending on desired behavior, might try to reconnect or just log
+                    # For now, just log and continue the loop
 
     def base_json_ctrl(self, input_json):
         self.send_command(input_json)

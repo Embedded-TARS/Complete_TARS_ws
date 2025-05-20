@@ -85,7 +85,12 @@ def main():
         cv2.destroyAllWindows()
         base.base_velocity_ctrl(0, 0)
         if hasattr(base, 'gimbal_dev_close'):
-            base.gimbal_dev_close()
+            pass
+        
+        # Add a shutdown call for the base controller if implemented
+        if hasattr(base, 'shutdown'):
+            base.shutdown()
+            
         print("🚗 자율주행 종료")
 
 # 메인 메뉴 출력 함수
