@@ -1,5 +1,7 @@
 .cargo
 *.lock
+*.jpg
+*.mp4
 
 **/videos/
 **/captures/
