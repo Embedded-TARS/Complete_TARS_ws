@@ -136,6 +136,7 @@ class BaseController:
 
         self.data_buffer = None
         self.base_data = None
+        self.imu_data = None
 
         # config.yaml에서 설정 로드
         self.use_lidar = f['base_config']['use_lidar']
@@ -145,25 +146,56 @@ class BaseController:
 
     def feedback_data(self):
         if self.virtual_mode:
-            return {"T": 1003, "virtual": True}
+            # 가상 모드에서는 더미 IMU 데이터 반환 (필요시)
+            # return {"T": 1002, "r": 0.0, "p": 0.0, "y": 0.0, "ax": 0.0, "ay": 0.0, "az": 9.8, "gx": 0.0, "gy": 0.0, "gz": 0.0, "temp": 25.0}
+            return {"T": 1003, "virtual": True} # 기본 가상 응답 유지
             
         try:
+            # 시리얼 버퍼에서 데이터 읽기
             while self.rl.s.in_waiting > 0:
-                self.data_buffer = json.loads(self.rl.readline().decode('utf-8'))
-                if 'T' in self.data_buffer:
-                    self.base_data = self.data_buffer
-                    self.data_buffer = None
-                    if self.base_data["T"] == 1003:
-                        print(self.base_data)
-                        return self.base_data
-            self.rl.clear_buffer()
-            self.data_buffer = json.loads(self.rl.readline().decode('utf-8'))
-            self.base_data = self.data_buffer
+                # 한 라인씩 읽고 디코딩 (오류 무시)
+                line = self.rl.readline().decode('utf-8', errors='ignore').strip()
+                if line:
+                    try:
+                        # JSON 파싱 시도
+                        data = json.loads(line)
+                        
+                        # 'T' 필드가 있는지 확인
+                        if 'T' in data:
+                            # T=1003 데이터는 self.base_data에 저장 (기존 로직 유지)
+                            if data['T'] == 1003:
+                                self.base_data = data
+                                # print(f"Received 1003: {self.base_data}") # 디버깅 출력 (필요시)
+                                
+                            # T=1002 데이터는 IMU 데이터로 간주하고 self.imu_data에 저장
+                            elif data['T'] == 1002:
+                                self.imu_data = data # IMU 데이터 저장
+                                # print(f"Received IMU (1002): {self.imu_data}") # 디버깅 출력 (필요시)
+                            
+                            # 다른 타입의 데이터도 필요에 따라 처리 가능
+                            # elif data['T'] == 126:
+                            #     print(f"Received command response (126): {data}") # 126 응답 자체는 데이터가 아닐 수 있음
+                                
+                    except json.JSONDecodeError:
+                        # JSON 파싱 오류 발생 시 출력
+                        print(f"[feedback_data] JSON Decode Error: {line}")
+                    except Exception as e:
+                        # 그 외 오류 발생 시 출력
+                        print(f"[feedback_data] Processing Error: {e} for line: {line}")
+                        
+            # 최신 base_data (T=1003)를 반환하거나, 없으면 None 반환
+            # IMU 데이터(T=1002)는 내부 변수에 저장되어 get_latest_imu_data()로 접근
             return self.base_data
+
         except Exception as e:
-            self.rl.clear_buffer()
-            print(f"[base_ctrl.feedback_data] error: {e}")
+            # 전체 예외 발생 시 출력
+            print(f"[base_ctrl.feedback_data] overall error: {e}")
             return {"error": str(e)}
+
+    # IMU 데이터 가져오는 메서드
+    def get_latest_imu_data(self):
+        """가장 최근에 수신된 T=1002 타입의 IMU 데이터를 반환합니다."""
+        return self.imu_data
 
     def on_data_received(self):
         if self.virtual_mode:

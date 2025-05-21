@@ -57,7 +57,7 @@ def get_key():
     """키 입력을 읽음"""
     return sys.stdin.read(1)
 
-def main():
+def main(display_mode=True):
     # 자율주행 모듈 및 카메라 초기화
     lane_model = LaneDetectionModel(model_path="lane.pt", lane_class_id=12)
     perception = LanePerception(lane_width_px=LANE_WIDTH_PX, ema_alpha=EMA_ALPHA)
@@ -121,15 +121,17 @@ def main():
             else:
                 controller.send_control(0, 0)  # 일시정지 상태일 때는 정지
 
-            # 차선 인식 시각화를 위해 perception 모듈에 위임
-            frame_with_lanes = perception.visualize_lanes(frame, deviation, steering, roi)
-            
-            # 일시정지 상태 표시
-            if is_paused:
-                cv2.putText(frame_with_lanes, "PAUSED", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-            
-            # 결과 이미지 출력
-            cv2.imshow("YOLO-AutoDrive", frame_with_lanes)
+            # 디스플레이 모드가 활성화된 경우에만 시각화 및 화면 표시
+            if display_mode:
+                # 차선 인식 시각화를 위해 perception 모듈에 위임
+                frame_with_lanes = perception.visualize_lanes(frame, deviation, steering, roi)
+                
+                # 일시정지 상태 표시
+                if is_paused:
+                    cv2.putText(frame_with_lanes, "PAUSED", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+                
+                # 결과 이미지 출력
+                cv2.imshow("YOLO-AutoDrive", frame_with_lanes)
 
             # 키 입력 처리 (터미널과 OpenCV 모두)
             if is_key_pressed():
@@ -141,14 +143,15 @@ def main():
                     sys.stdout.write("\n⏸️ 일시정지\n" if is_paused else "\n▶️ 재시작\n")
                     sys.stdout.flush()
             
-            # OpenCV 창의 키 입력도 처리
-            key = cv2.waitKey(1) & 0xFF
-            if key in (ord('q'), ord('Q')):
-                break
-            elif key == 32:  # 스페이스바
-                is_paused = not is_paused
-                sys.stdout.write("\n⏸️ 일시정지\n" if is_paused else "\n▶️ 재시작\n")
-                sys.stdout.flush()
+            # OpenCV 창의 키 입력도 처리 (디스플레이 모드가 활성화된 경우에만)
+            if display_mode:
+                key = cv2.waitKey(1) & 0xFF
+                if key in (ord('q'), ord('Q')):
+                    break
+                elif key == 32:  # 스페이스바
+                    is_paused = not is_paused
+                    sys.stdout.write("\n⏸️ 일시정지\n" if is_paused else "\n▶️ 재시작\n")
+                    sys.stdout.flush()
 
     except KeyboardInterrupt:
         print("\n자율주행 모드가 Ctrl+C로 중단되었습니다.")
@@ -160,7 +163,8 @@ def main():
         
         # 자율주행 종료 시 정리 작업
         camera_manager.release_camera()
-        cv2.destroyAllWindows()
+        if display_mode:
+            cv2.destroyAllWindows()
         base.base_velocity_ctrl(0, 0)
         if hasattr(base, 'gimbal_dev_close'):
             pass
@@ -174,7 +178,8 @@ def main():
 # 메인 메뉴 출력 함수
 def print_menu():
     print("\n===== 모드 선택 =====")
-    print("a: 자율주행 (lane tracking)")
+    print("a: 자율주행 (lane tracking) - 화면 표시")
+    print("an: 자율주행 (lane tracking) - 화면 미표시")
     print("mp: 메뉴얼 (Pygame)")
     print("mt: 메뉴얼 (Terminal) - 비디오 녹화 포함")
     print("c: 카메라 테스트")
@@ -188,10 +193,12 @@ def print_menu():
 def main_menu():
     while True:
         print_menu()
-        mode = input("모드 선택 (a/mp/mt/c/cc/cal/q/x): ").strip().lower()
+        mode = input("모드 선택 (a/an/mp/mt/c/cc/cal/q/x): ").strip().lower()
 
         if mode == 'a':
-            main()  # 자율주행 모드 실행
+            main(display_mode=True)  # 자율주행 모드 실행 (화면 표시)
+        elif mode == 'an':
+            main(display_mode=False)  # 자율주행 모드 실행 (화면 미표시)
         elif mode == 'mp':
             controller = PygameKeyboardController(base)
             result = controller.run()

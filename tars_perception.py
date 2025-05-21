@@ -18,9 +18,29 @@ class LaneDetectionModel:
         print(f"YOLO 모델을 {self.device}에 로드하는 중...")
         self.model = YOLO(model_path).to(self.device)
         print(f"✅ YOLO 모델이 {self.device}에 로드되었습니다.")
+        self.last_conf = 0.5  # 초기 신뢰도 임계값
+        self.conf_history = []  # 신뢰도 이력
     
     def predict(self, frame):
-        return self.model.predict(frame, device=self.device, conf=0.5, iou=0.45)
+        # 적응형 신뢰도 임계값 계산
+        if len(self.conf_history) > 0:
+            avg_conf = sum(self.conf_history) / len(self.conf_history)
+            # 이전 프레임의 신뢰도가 낮았으면 임계값을 낮춤
+            if avg_conf < 0.4:
+                self.last_conf = max(0.3, self.last_conf - 0.05)
+            # 이전 프레임의 신뢰도가 높았으면 임계값을 높임
+            elif avg_conf > 0.6:
+                self.last_conf = min(0.5, self.last_conf + 0.05)
+        
+        results = self.model.predict(frame, device=self.device, conf=self.last_conf, iou=0.45)
+        
+        # 현재 프레임의 신뢰도 저장
+        if len(results) > 0 and len(results[0].boxes) > 0:
+            self.conf_history.append(results[0].boxes.conf.mean().item())
+            if len(self.conf_history) > 5:  # 최근 5프레임만 유지
+                self.conf_history.pop(0)
+        
+        return results
 
 # 이미지 하단 절반을 ROI (관심 영역)로 설정하는 함수
 # def get_roi_slice(H_img):
@@ -90,6 +110,11 @@ class LanePerception:
         self.last_update_time = time.time()
         self.fps = 0
         
+        # 곡선 감지 관련 변수 추가
+        self.is_curve = False
+        self.curve_direction = 0  # -1: 왼쪽 곡선, 1: 오른쪽 곡선
+        self.curve_history = []  # 최근 5프레임의 곡선 방향 이력
+        
         # 디버깅 텍스트 색상 정의
         self.text_color = (0, 200, 255)  # 주황색
         self.fps_color = (0, 255, 0)     # 녹색
@@ -104,6 +129,37 @@ class LanePerception:
         y_max = ys.max()
         x_mean = xs[ys == y_max].mean()
         return float(y_max), float(x_mean)
+
+    def _detect_curve(self, left_coef: Optional[np.ndarray], right_coef: Optional[np.ndarray]) -> None:
+        """곡선 구간 감지"""
+        if left_coef is not None and right_coef is not None:
+            # 두 차선의 기울기 차이로 곡선 감지
+            left_slope = left_coef[0] if len(left_coef) > 1 else 0
+            right_slope = right_coef[0] if len(right_coef) > 1 else 0
+            slope_diff = right_slope - left_slope
+            
+            # 곡선 방향 결정
+            if abs(slope_diff) > 0.1:  # 곡선 감지 임계값
+                self.is_curve = True
+                self.curve_direction = 1 if slope_diff > 0 else -1
+            else:
+                self.is_curve = False
+                self.curve_direction = 0
+            
+            # 곡선 방향 이력 업데이트
+            self.curve_history.append(self.curve_direction)
+            if len(self.curve_history) > 5:
+                self.curve_history.pop(0)
+            
+            # 최근 5프레임 중 3프레임 이상이 같은 방향이면 곡선으로 판단
+            if len(self.curve_history) >= 3:
+                most_common = max(set(self.curve_history), key=self.curve_history.count)
+                if self.curve_history.count(most_common) >= 3:
+                    self.is_curve = True
+                    self.curve_direction = most_common
+                else:
+                    self.is_curve = False
+                    self.curve_direction = 0
 
     def update(self, results, *, roi: Optional[slice] = None, thr: float = 0.5) -> Optional[float]:
         start_time = time.time()
@@ -132,9 +188,7 @@ class LanePerception:
             if xs.size < self.poly_deg + 1:
                 return None
 
-            # Add check for unique y-coordinates
             if np.unique(ys).size < self.poly_deg + 1:
-                # print(f"Debug: Not enough unique y-coordinates for polyfit (needed: {self.poly_deg + 1}, got: {np.unique(ys).size})") # Optional debug print
                 return None
 
             return np.polyfit(ys, xs, self.poly_deg)
@@ -158,7 +212,15 @@ class LanePerception:
                 self.left_x_prev, self.left_y_prev = x_left, y_left + roi.start
                 self.right_x_prev, self.right_y_prev = x_right, y_right + roi.start
                 
-                self.center_raw = (x_left + x_right) / 2.0
+                # 곡선 감지 수행
+                self._detect_curve(self.left_coef, self.right_coef)
+                
+                # 곡선 구간에서는 차선 중앙점을 곡선 방향으로 약간 조정
+                if self.is_curve:
+                    curve_offset = 20 * self.curve_direction  # 곡선 방향으로 20픽셀 조정
+                    self.center_raw = (x_left + x_right) / 2.0 + curve_offset
+                else:
+                    self.center_raw = (x_left + x_right) / 2.0
                 
                 # FPS 계산
                 current_time = time.time()
@@ -194,7 +256,15 @@ class LanePerception:
                 self.left_coef, self.left_mask = None, None
                 self.right_coef, self.right_mask = _fit(full[idx]), full[idx]
                 
-        self.center_raw = (x_left + x_right) / 2.0
+        # 곡선 감지 수행
+        self._detect_curve(self.left_coef, self.right_coef)
+        
+        # 곡선 구간에서는 차선 중앙점을 곡선 방향으로 약간 조정
+        if self.is_curve:
+            curve_offset = 20 * self.curve_direction  # 곡선 방향으로 20픽셀 조정
+            self.center_raw = (x_left + x_right) / 2.0 + curve_offset
+        else:
+            self.center_raw = (x_left + x_right) / 2.0
         
         # FPS 계산
         current_time = time.time()
@@ -286,6 +356,13 @@ class LanePerception:
         cv2.putText(frame_with_lanes, f"{self.fps:.1f} FPS", 
                     (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1.0, self.fps_color, 2)
         
+        # 곡선 상태 표시
+        curve_status = "Straight"
+        if self.is_curve:
+            curve_status = f"Curve {'Right' if self.curve_direction > 0 else 'Left'}"
+        cv2.putText(frame_with_lanes, curve_status, 
+                    (10, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.9, self.text_color, 2)
+        
         # Lane status display
         lane_status = "Both lanes detected"
         if self.left_coef is not None and self.right_coef is None:
@@ -295,8 +372,6 @@ class LanePerception:
         elif self.left_coef is None and self.right_coef is None:
             lane_status = "Lane not detected"
             
-        print(f"Lane Status: {lane_status}")
-
         cv2.putText(frame_with_lanes, lane_status, 
                     (10, frame.shape[0] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, self.lane_status_color, 2)
         
