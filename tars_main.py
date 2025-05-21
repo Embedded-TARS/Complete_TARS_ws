@@ -18,6 +18,9 @@ import pygame
 from tars_manual_ctrl import PygameKeyboardController
 from tars_manual_ctrl import TerminalKeyboardController
 import pathlib
+import termios
+import tty
+import select
 from tars_config import (  # 설정 모듈 임포트
     get_roi_slice, CAMERA_WIDTH, CAMERA_HEIGHT, CAMERA_FPS, 
     LANE_WIDTH_PX, EMA_ALPHA, CAPTURE_DIR
@@ -35,16 +38,24 @@ else:
 # BaseController 인스턴스 생성
 base = BaseController(port, 115200)
 
-# 자율주행 메인 루프
-# def main():
-#     # 자율주행 모듈 및 카메라 초기화
-#     lane_model = LaneDetectionModel(model_path="lane.pt", lane_class_id=12)
-#     perception = LanePerception(lane_width_px=700, ema_alpha=0.8)
-#     planner = LanePlanner()
-#     controller = RobotController(base)
-#     camera_manager = CameraManager.get_instance()
-#     camera_manager.initialize_camera(width=640, height=480, capture_fps=30)
-#
+# 터미널 설정을 위한 함수들
+def set_terminal_mode():
+    """터미널을 raw 모드로 설정"""
+    old_settings = termios.tcgetattr(sys.stdin)
+    tty.setraw(sys.stdin.fileno())
+    return old_settings
+
+def restore_terminal_mode(old_settings):
+    """터미널 설정을 원래대로 복구"""
+    termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
+
+def is_key_pressed():
+    """키 입력이 있는지 확인"""
+    return select.select([sys.stdin], [], [], 0)[0]
+
+def get_key():
+    """키 입력을 읽음"""
+    return sys.stdin.read(1)
 
 def main():
     # 자율주행 모듈 및 카메라 초기화
@@ -55,7 +66,12 @@ def main():
     camera_manager = CameraManager.get_instance()
     camera_manager.initialize_camera(width=CAMERA_WIDTH, height=CAMERA_HEIGHT, capture_fps=CAMERA_FPS)
 
-    print("🚗 자율주행 모드 시작 - q 키를 눌러 종료")
+    print("🚗 자율주행 모드 시작 - q 키를 눌러 종료, 스페이스바로 일시정지/재시작")
+    
+    is_paused = False  # 일시정지 상태를 추적하는 변수
+    
+    # 터미널 설정 변경
+    old_terminal_settings = set_terminal_mode()
     
     try:
         while True:
@@ -68,37 +84,80 @@ def main():
             # 이미지 중앙 x 좌표 계산
             img_center_x = (frame.shape[1] // 2) - 11
 
-            # y = frame.shape[0]
-            # roi = slice(y * 2 // 4, y)
             roi = get_roi_slice(frame.shape[0]) 
 
             # Perception: YOLO 추론 및 차선 감지
             results = lane_model.predict(frame)
             lane_center_x = perception.update(results[0], roi = roi)
-            print(f"lane_center_x : {lane_center_x}")
+            
+            # 출력 정리
+            sys.stdout.write('\033[2J\033[H')  # 화면 클리어 및 커서를 맨 위로
+            sys.stdout.flush()
+            
+            status = [
+                "=== 자율주행 상태 ===",
+                f"차선 중심점: {lane_center_x:.2f}" if lane_center_x is not None else "차선 감지: ❌ (차선을 찾을 수 없음)",
+                f"이미지 중심점: {img_center_x}",
+                f"상태: {'일시정지' if is_paused else '주행중'}",
+                "==================="
+            ]
+            
+            # 한 번에 모든 상태 출력
+            sys.stdout.write('\n'.join(status) + '\n')
+            sys.stdout.flush()
 
             # Planning: 속도 및 스티어링 결정
-            linear_speed, steering, deviation = planner.plan(lane_center_x, img_center_x)
+            if lane_center_x is not None:
+                linear_speed, steering, deviation = planner.plan(lane_center_x, img_center_x)
+            else:
+                # 차선이 감지되지 않았을 때는 천천히 직진
+                linear_speed = 0.3  # 낮은 속도
+                steering = 0.0      # 직진
+                deviation = 0.0
 
-            # Control: 로봇에 제어 명령 전송
-            controller.send_control(linear_speed, steering)
+            # Control: 로봇에 제어 명령 전송 (일시정지 상태가 아닐 때만)
+            if not is_paused:
+                controller.send_control(linear_speed, steering)
+            else:
+                controller.send_control(0, 0)  # 일시정지 상태일 때는 정지
 
             # 차선 인식 시각화를 위해 perception 모듈에 위임
             frame_with_lanes = perception.visualize_lanes(frame, deviation, steering, roi)
             
+            # 일시정지 상태 표시
+            if is_paused:
+                cv2.putText(frame_with_lanes, "PAUSED", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+            
             # 결과 이미지 출력
-            cv2.imshow("YOLO-AutoDrive", frame_with_lanes)
+            # cv2.imshow("YOLO-AutoDrive", frame_with_lanes)
 
-            # 키 입력 처리
+            # 키 입력 처리 (터미널과 OpenCV 모두)
+            if is_key_pressed():
+                key = get_key()
+                if key == 'q':
+                    break
+                elif key == ' ':  # 스페이스바
+                    is_paused = not is_paused
+                    sys.stdout.write("\n⏸️ 일시정지\n" if is_paused else "\n▶️ 재시작\n")
+                    sys.stdout.flush()
+            
+            # OpenCV 창의 키 입력도 처리
             key = cv2.waitKey(1) & 0xFF
             if key in (ord('q'), ord('Q')):
                 break
+            elif key == 32:  # 스페이스바
+                is_paused = not is_paused
+                sys.stdout.write("\n⏸️ 일시정지\n" if is_paused else "\n▶️ 재시작\n")
+                sys.stdout.flush()
 
     except KeyboardInterrupt:
         print("\n자율주행 모드가 Ctrl+C로 중단되었습니다.")
     except Exception as e:
         print(f"\n자율주행 모드 오류: {e}")
     finally:
+        # 터미널 설정 복구
+        restore_terminal_mode(old_terminal_settings)
+        
         # 자율주행 종료 시 정리 작업
         camera_manager.release_camera()
         cv2.destroyAllWindows()

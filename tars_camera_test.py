@@ -6,7 +6,7 @@ from ultralytics import YOLO
 from jetcam.csi_camera import CSICamera
 from tars_config import (
     get_roi_slice, LANE_WIDTH_PX, CAMERA_WIDTH, CAMERA_HEIGHT, 
-    CAMERA_FPS, POLY_DEG, EMA_ALPHA, ROI_RATIO
+    CAMERA_FPS, POLY_DEG, EMA_ALPHA, ROI_RATIO, MIDDLE_LANE_WIDTH_PX
 )
 
 # def get_roi_slice(H_img):
@@ -17,14 +17,17 @@ class LanePerception:
     """차선 중앙을 추적하고 필요에 따라 EMA(지수 이동 평균)로 스무딩합니다."""
     
     def __init__(self, *, lane_width_px: float = LANE_WIDTH_PX, 
+                 middle_lane_width_px: float = MIDDLE_LANE_WIDTH_PX,
                  ema_alpha: float = EMA_ALPHA,
                  poly_deg: int = POLY_DEG):
         print(f"\nLanePerception 초기화:")
         print(f"lane_width_px: {lane_width_px}")
+        print(f"middle_lane_width_px: {middle_lane_width_px}")
         print(f"ema_alpha: {ema_alpha}")
         print(f"poly_deg: {poly_deg}")
         
         self.lane_width_px = lane_width_px
+        self.middle_lane_width_px = middle_lane_width_px
         self.ema_alpha = ema_alpha
         self.poly_deg = poly_deg
 
@@ -58,6 +61,12 @@ class LanePerception:
         self.left_confidence = 0.0
         self.right_confidence = 0.0
         self.mask_debug = None
+
+    def _get_dynamic_lane_width(self, y: float, H: int) -> float:
+        """y좌표에 따라 동적으로 차선 폭을 계산합니다."""
+        # y가 0에 가까울수록 middle_lane_width_px에 가깝게, H에 가까울수록 lane_width_px에 가깝게
+        ratio = y / H
+        return self.middle_lane_width_px * (1 - ratio) + self.lane_width_px * ratio
 
     def _calculate_center_coefficients(self):
         """왼쪽과 오른쪽 차선의 계수를 사용하여 중앙 차선의 계수를 계산합니다."""
@@ -357,9 +366,11 @@ class LanePerception:
                               if np.any(x_check < -full[idx].shape[1]*0.2) or np.any(x_check > full[idx].shape[1]*1.2): # Wider bounds for estimated lane
                                    estimated_right_coef = None # Invalidate if out of bounds
                          else:
-                             # If previous left is not available, assume parallel and use lane width
-                              estimated_right_coef = detected_coef.copy()
-                              estimated_right_coef[-1] += self.lane_width_px # Simple width assumption
+                             # If previous left is not available, use dynamic lane width
+                             estimated_right_coef = detected_coef.copy()
+                             # Use dynamic lane width based on y-coordinate
+                             dynamic_width = self._get_dynamic_lane_width(y_bottom_sample, len(full[idx]))
+                             estimated_right_coef[-1] += dynamic_width
                  # Assign estimated coefficient, allowing it to be None if estimation failed
                  self.right_coef = estimated_right_coef
                  self.left_coef_prev = self.left_coef
@@ -383,9 +394,11 @@ class LanePerception:
                              if np.any(x_check < -full[idx].shape[1]*0.2) or np.any(x_check > full[idx].shape[1]*1.2):
                                   estimated_left_coef = None
                          else:
-                             # If previous right is not available, assume parallel and use lane width
+                             # If previous right is not available, use dynamic lane width
                              estimated_left_coef = detected_coef.copy()
-                             estimated_left_coef[-1] -= self.lane_width_px # Simple width assumption
+                             # Use dynamic lane width based on y-coordinate
+                             dynamic_width = self._get_dynamic_lane_width(y_bottom_sample, len(full[idx]))
+                             estimated_left_coef[-1] -= dynamic_width
 
                  # Assign estimated coefficient
                  self.left_coef = estimated_left_coef
@@ -447,6 +460,12 @@ class LanePerception:
         frame_with_lanes = frame.copy()
 
         y_offset = roi.start or 0
+        H_img, W_img = frame.shape[:2]
+        
+        # ROI 영역 시각화
+        cv2.line(frame_with_lanes, (0, y_offset), (W_img, y_offset), (0, 255, 0), 2)
+        cv2.putText(frame_with_lanes, f"ROI (y={y_offset})", (10, y_offset-10), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
         
         # 왼쪽 차선 그리기
         if self.left_coef is not None and self.left_mask is not None:
@@ -462,6 +481,7 @@ class LanePerception:
             if self.left_x_prev is not None and self.left_y_prev is not None:
                 cv2.putText(frame_with_lanes, f"Left: ({self.left_x_prev:.1f}, {self.left_y_prev:.1f})", 
                            (10, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.7, self.text_color, 2)
+            cv2.putText(frame_with_lanes, "Left lane", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
         
         # 오른쪽 차선 그리기
         if self.right_coef is not None and self.right_mask is not None:
@@ -477,6 +497,7 @@ class LanePerception:
             if self.right_x_prev is not None and self.right_y_prev is not None:
                 cv2.putText(frame_with_lanes, f"Right: ({self.right_x_prev:.1f}, {self.right_y_prev:.1f})", 
                            (10, 140), cv2.FONT_HERSHEY_SIMPLEX, 0.7, self.text_color, 2)
+            cv2.putText(frame_with_lanes, "Right lane", (50, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
         
         # 중앙 차선 그리기
         if self.center_coef is not None:
@@ -497,12 +518,10 @@ class LanePerception:
                     # Ensure masks have the same shape before combining
                     if self.left_mask.shape == valid_mask_shape:
                         center_mask = np.logical_or(center_mask, self.left_mask).astype(np.uint8)
-                    # else: print("Debug: Left mask shape mismatch during center_mask creation")
 
                 if self.right_mask is not None and isinstance(self.right_mask, np.ndarray):
                      if self.right_mask.shape == valid_mask_shape:
                         center_mask = np.logical_or(center_mask, self.right_mask).astype(np.uint8)
-                     # else: print("Debug: Right mask shape mismatch during center_mask creation")
 
             # Only attempt to draw if center_mask was successfully created and has content
             if center_mask is not None and np.sum(center_mask) > 0:
@@ -527,7 +546,7 @@ class LanePerception:
         
         # 차선 중앙 표시 (인식된 경우)
         if self.center_px is not None:
-            img_center_x = frame.shape[1] // 2 - 11
+            img_center_x = frame.shape[1] // 2
             
             # 차선 중앙점 좌표
             center_point = (int(self.center_px), frame.shape[0] - 30)
@@ -535,10 +554,16 @@ class LanePerception:
             img_center_point = (img_center_x, frame.shape[0] - 30)
             
             # 차선 중앙 점 그리기
-            cv2.circle(frame_with_lanes, center_point, 5, (0, 255, 255), -1)  # 노란색 원
+            cv2.circle(frame_with_lanes, center_point, 8, (0, 255, 255), -1)  # 노란색 원
+            cv2.putText(frame_with_lanes, f"Lane center: {self.center_px:.1f}", 
+                       (int(self.center_px) + 10, frame.shape[0] - 30), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
             
             # 이미지 중앙 점 그리기
-            cv2.circle(frame_with_lanes, img_center_point, 5, (255, 0, 255), -1)  # 핑크색 원
+            cv2.circle(frame_with_lanes, img_center_point, 8, (255, 0, 255), -1)  # 핑크색 원
+            cv2.putText(frame_with_lanes, f"Image center: {img_center_x}", 
+                       (img_center_x + 10, frame.shape[0] - 60), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
             
             # 두 점을 연결하는 선
             cv2.line(frame_with_lanes, center_point, img_center_point, (255, 255, 255), 2)
@@ -554,13 +579,15 @@ class LanePerception:
                     (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1.0, self.fps_color, 2)
         
         # Lane status display
-        lane_status = "Both lanes detected"
-        if self.left_coef is not None and self.right_coef is None:
-            lane_status = "Only left lane detected"
-        elif self.left_coef is None and self.right_coef is not None:
-            lane_status = "Only right lane detected"
-        elif self.left_coef is None and self.right_coef is None:
-            lane_status = "Lane not detected"
+        lane_status = "상태: "
+        if self.left_coef is not None and self.right_coef is not None:
+            lane_status += "양쪽 차선 감지됨"
+        elif self.left_coef is not None:
+            lane_status += "왼쪽 차선만 감지됨"
+        elif self.right_coef is not None:
+            lane_status += "오른쪽 차선만 감지됨"
+        else:
+            lane_status += "차선 감지 안됨"
             
         print(f"Lane Status: {lane_status}")
 
@@ -720,10 +747,14 @@ def camera_test_main():
         frame_with_lanes = lane_perception.visualize_lanes(frame, roi=roi)
         
         # ROI 영역 시각화
+        roi_vis = frame.copy()
         y_start = roi.start
-        cv2.line(frame_with_lanes, (0, y_start), (W_img, y_start), (0, 255, 0), 2)
-        cv2.putText(frame_with_lanes, f"ROI (y={y_start})", (10, y_start-10), 
+        cv2.line(roi_vis, (0, y_start), (W_img, y_start), (0, 255, 0), 2)
+        cv2.putText(roi_vis, f"ROI (y={y_start})", (10, y_start-10), 
                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        
+        # ROI 영역에서의 처리 결과 시각화
+        frame_roi = frame[roi].copy()
         
         # FPS 계산 및 표시
         current_time = time.time()
@@ -732,7 +763,23 @@ def camera_test_main():
         cv2.putText(frame_with_lanes, f"FPS: {fps:.1f}", (10, 30), 
                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
 
+        # 박스 그리기
+        boxes = r.boxes
+        if len(boxes) > 0:
+            clss = boxes.cls.cpu().numpy()
+            confs = boxes.conf.cpu().numpy()
+            xyxy = boxes.xyxy.cpu().numpy()
+            
+            for (x1, y1, x2, y2), cls_id, conf in zip(xyxy, clss, confs):
+                label = f"{lane_model.model.names[int(cls_id)]} {conf:.2f}"
+                p1, p2 = (int(x1), int(y1)), (int(x2), int(y2))
+                cv2.rectangle(frame_with_lanes, p1, p2, (0, 255, 255), 2)
+                cv2.putText(frame_with_lanes, label, (p1[0], p1[1]-8),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+
         cv2.imshow("Lane Detection", frame_with_lanes)
+        cv2.imshow("Lane-ROI", frame_roi)
+        cv2.imshow("ROI Visualization", roi_vis)
         
         key = cv2.waitKey(1) & 0xFF
         if key in (ord('q'), ord('Q')):
