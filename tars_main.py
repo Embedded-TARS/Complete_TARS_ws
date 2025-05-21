@@ -129,7 +129,7 @@ def main():
                 cv2.putText(frame_with_lanes, "PAUSED", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
             
             # 결과 이미지 출력
-            # cv2.imshow("YOLO-AutoDrive", frame_with_lanes)
+            cv2.imshow("YOLO-AutoDrive", frame_with_lanes)
 
             # 키 입력 처리 (터미널과 OpenCV 모두)
             if is_key_pressed():
