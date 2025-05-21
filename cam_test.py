@@ -1,549 +1,361 @@
 import cv2
-import numpy as np
 import time
-import argparse
-import os
-import sys
-import traceback
+import torch
+import numpy as np
+from ultralytics import YOLO
+from jetcam.csi_camera import CSICamera
+from tars_config import (
+    get_roi_slice, LANE_WIDTH_PX, CAMERA_WIDTH, CAMERA_HEIGHT, 
+    CAMERA_FPS, POLY_DEG, EMA_ALPHA, ROI_RATIO
+)
 
-try:
-    import torch
-    from ultralytics import YOLO
-    YOLO_AVAILABLE = True
-except ImportError:
-    YOLO_AVAILABLE = False
-    print("⚠️ ultralytics 또는 torch를 가져올 수 없습니다.")
-    print("pip install ultralytics torch 명령으로 설치하세요.")
-
-# 설정값
-DEFAULT_CAMERA_WIDTH = 640
-DEFAULT_CAMERA_HEIGHT = 480
-DEFAULT_CAMERA_FPS = 30
-ROI_RATIO = 0.5  # ROI 시작 위치 (이미지 높이의 비율)
-LANE_WIDTH_PX = 700  # 예상 차선 폭(픽셀)
-POLY_DEG = 2  # 차선 곡선 피팅에 사용할 다항식 차수
-EMA_ALPHA = 0.8  # 차선 중앙 위치 스무딩 계수
-
-def get_roi_slice(img_height):
-    """이미지 높이에 기반하여 ROI 슬라이스를 계산합니다."""
-    roi_start = int(img_height * ROI_RATIO)
-    return slice(roi_start, img_height)
-
-class LanePerception:
-    """차선 중앙을 추적하고 필요에 따라 EMA(지수 이동 평균)로 스무딩합니다."""
-    
-    def __init__(self, lane_width_px=LANE_WIDTH_PX, ema_alpha=EMA_ALPHA, poly_deg=POLY_DEG):
+class LaneCenterTracker:
+    def __init__(self, lane_width_px: float = LANE_WIDTH_PX, poly_deg: int = POLY_DEG):
+        print(f"\nLaneCenterTracker 초기화:")
+        print(f"lane_width_px: {lane_width_px}")
+        print(f"poly_deg: {poly_deg}")
+        
         self.lane_width_px = lane_width_px
-        self.ema_alpha = ema_alpha
         self.poly_deg = poly_deg
-
-        self.center_raw = None
-        self.center_px = None
-
-        self.left_x_prev = self.left_y_prev = None
-        self.right_x_prev = self.right_y_prev = None
-
         self.left_coef = None
         self.right_coef = None
-        self.left_mask = None
-        self.right_mask = None
+        self.center_px = None
+        self.left_y_range = None
+        self.right_y_range = None
         
-        # 성능 모니터링 변수
-        self.last_update_time = time.time()
-        self.fps = 0
-        
-        # 디버깅 텍스트 색상 정의
-        self.text_color = (0, 200, 255)  # 주황색
-        self.fps_color = (0, 255, 0)     # 녹색
-        self.time_color = (255, 255, 0)  # 노랑색
-        self.lane_status_color = (255, 255, 255)  # 흰색
+        # 디버깅을 위한 변수 추가
+        self.debug_masks = None
 
-    @staticmethod
-    def _mask_bottom_x(mask_bin):
-        """마스크의 하단 중심 x 좌표를 찾습니다."""
-        if mask_bin is None or mask_bin.size == 0:
-            return None, None
-            
+    def _mask_to_poly_bottom(self, mask_bin: np.ndarray, thr=0.5):
+        """mask_bin : 2-D uint8 (0/1)"""
         ys, xs = np.nonzero(mask_bin)
-        if xs.size == 0:
-            return None, None
-        y_max = ys.max()
-        x_mean = xs[ys == y_max].mean()
-        return float(y_max), float(x_mean)
+        if xs.size < self.poly_deg + 1:           # 데이터 부족
+            return None, None, None
+            
+        # 유니크한 y값이 poly_deg+1보다 적으면 다항식 피팅 불가
+        if np.unique(ys).size < self.poly_deg + 1:
+            print(f"경고: 유니크한 y값이 부족함 (필요: {self.poly_deg + 1}, 실제: {np.unique(ys).size})")
+            return None, None, None
+            
+        # (1) 다항식(x) = f(y)  ← y가 세로(row)
+        coef = np.polyfit(ys, xs, self.poly_deg)
+        # (2) 이미지 하단(row = H-1)에서 x 좌표 예측
+        y_bottom = mask_bin.shape[0] - 1
+        x_bottom = np.polyval(coef, y_bottom)
+        y_min, y_max = int(np.min(ys)), int(np.max(ys))
+        return coef, float(x_bottom), (y_min, y_max)
 
-    def update(self, results, roi=None, thr=0.5):
+    def update(self, results, *, roi=None, thr=0.5):
         """
-        YOLO 결과를 기반으로 차선 중앙을 업데이트합니다.
+        results : ultralytics.engine.results.Results (단일 이미지)
+        returns : center_x (float) or None
         """
-        start_time = time.time()
+        r = results
+        H_img, W_img = r.orig_shape[:2]
+        roi = roi or get_roi_slice(H_img)  # 설정 모듈의 함수 사용
         
-        if results is None:
-            return self.center_px
-            
-        r = results[0]  # 첫 번째 결과만 사용
+        print(f"\n이미지 크기: {W_img}x{H_img}, ROI: y={roi.start}~{roi.stop}")
         
-        try:
-            H_img, W_img = r.orig_shape[:2]
-            roi = roi or slice(0, H_img)
+        if r.masks is None or len(r.masks.data) == 0:     # CASE 0
+            print("⚠️ 마스크가 감지되지 않음")
+            return self.center_px                         # 그대로 유지
 
-            if r.masks is None or len(r.masks.data) == 0:
-                return self.center_px
+        # (A) 모든 mask → 원본 해상도(픽셀)로 upsample
+        masks = r.masks.data.cpu().numpy()                # (N,160,160) etc.
+        print(f"✅ {len(masks)}개의 마스크 감지됨")
+        
+        full_bin = [cv2.resize((m > thr).astype(np.uint8),
+                                (W_img, H_img),
+                                cv2.INTER_NEAREST)[roi]
+                    for m in masks]    
 
-            # 마스크 데이터가 있는 경우에만 처리
-            masks_np = r.masks.data.cpu().numpy()
-            
-            # 마스크 리사이즈 및 ROI 적용
-            full = []
-            for m in masks_np:
-                try:
-                    # 이진 마스크로 변환
-                    binary_mask = (m > thr).astype(np.uint8)
-                    
-                    # 원본 크기로 리사이즈
-                    resized = cv2.resize(binary_mask, (W_img, H_img), cv2.INTER_NEAREST)
-                    
-                    # ROI 적용
-                    roi_mask = resized[roi]
-                    
-                    full.append(roi_mask)
-                except Exception as e:
-                    print(f"마스크 처리 중 오류: {e}")
-                    continue
-            
-            if not full:  # 마스크가 없으면 종료
-                return self.center_px
-            
-            counts = np.array([m.sum() for m in full])
-            if counts.max() == 0:
-                return self.center_px
-            
-            order = counts.argsort()[::-1]
+        # 디버깅용 마스크 시각화 이미지 생성
+        self.debug_masks = np.zeros((roi.stop - roi.start, W_img, 3), dtype=np.uint8)
 
-            def _fit(mask_bin):
-                """마스크로부터 다항식 계수를 계산합니다."""
-                if self.poly_deg is None or mask_bin is None:
-                    return None
-                    
-                ys, xs = np.nonzero(mask_bin)
-                if xs.size < self.poly_deg + 1:
-                    return None
+        # (B) 픽셀 수 기준 내림차순 정렬
+        pix_counts = [m.sum() for m in full_bin]
+        idx_sorted = np.argsort(pix_counts)[::-1]
+        
+        print(f"마스크 픽셀 수: {pix_counts}")
+        print(f"정렬된 인덱스: {idx_sorted}")
+        
+        # 마스크 시각화 (색상으로 구분)
+        for i, idx in enumerate(idx_sorted):
+            if i == 0:  # 첫 번째 마스크 (가장 큰 것) - 빨간색
+                self.debug_masks[full_bin[idx] > 0] = (0, 0, 255)
+            elif i == 1:  # 두 번째 마스크 - 초록색
+                self.debug_masks[full_bin[idx] > 0] = (0, 255, 0)
+            else:  # 그 외 마스크 - 파란색
+                self.debug_masks[full_bin[idx] > 0] = (255, 0, 0)
 
-                # 고유한 y 좌표 체크
-                if np.unique(ys).size < self.poly_deg + 1:
-                    return None
-
-                try:
-                    return np.polyfit(ys, xs, self.poly_deg)
-                except Exception:
-                    # 다항식 피팅 오류 - 더 낮은 차수로 시도
-                    try:
-                        return np.polyfit(ys, xs, 1)  # 1차 다항식으로 시도
-                    except Exception:
-                        return None
-
-            # 두 개의 가장 큰 마스크를 차선으로 처리
-            if len(order) >= 2:
-                try:
-                    i1, i2 = order[:2]
-                    y1, x1 = self._mask_bottom_x(full[i1])
-                    y2, x2 = self._mask_bottom_x(full[i2])
-                    
-                    if None not in (x1, x2):
-                        if x1 < x2:
-                            x_left, y_left, x_right, y_right = x1, y1, x2, y2
-                            self.left_coef, self.left_mask  = _fit(full[i1]), full[i1]
-                            self.right_coef, self.right_mask = _fit(full[i2]), full[i2]
-                        else:
-                            x_left, y_left, x_right, y_right = x2, y2, x1, y1
-                            self.left_coef, self.left_mask  = _fit(full[i2]), full[i2]
-                            self.right_coef, self.right_mask = _fit(full[i1]), full[i1]
-                            
-                        self.left_x_prev, self.left_y_prev = x_left, y_left + roi.start
-                        self.right_x_prev, self.right_y_prev = x_right, y_right + roi.start
-                        
-                        self.center_raw = (x_left + x_right) / 2.0
-                        
-                        # FPS 계산
-                        current_time = time.time()
-                        elapsed = current_time - self.last_update_time
-                        self.last_update_time = current_time
-                        self.fps = 1.0 / elapsed if elapsed > 0 else 0
-                        
-                        return self._apply_ema()
-                except Exception as e:
-                    print(f"두 차선 처리 중 오류: {e}")
-                    # 오류 발생 시 싱글 차선 로직으로 진행
-                    
-            # 하나의 마스크만 사용 (싱글 차선)
-            try:
-                idx = order[0]
-                yb, xb = self._mask_bottom_x(full[idx])
+        # ──────────────────────────────────────────
+        # CASE 2 : 두 개 이상 검출
+        # ──────────────────────────────────────────
+        if len(idx_sorted) >= 2:
+            idx_top2 = idx_sorted[:2]
+            infos = [self._mask_to_poly_bottom(full_bin[i]) for i in idx_top2]
+            # infos = [(coef, x_bottom), ...]  길이가 2
+            if any(c is None for c, _, _ in infos):
+                print("⚠️ 다항식 피팅 실패")
+                return self.center_px                    # 실패 → 이전 값
                 
-                if xb is None:
-                    return self.center_px
-                    
-                xb_g = xb
-                yb_g = yb + roi.start
-                
-                dl = abs(xb_g - self.left_x_prev) if self.left_x_prev is not None else np.inf
-                dr = abs(xb_g - self.right_x_prev) if self.right_x_prev is not None else np.inf
-                
-                if dl < dr:
-                    self.left_x_prev, self.left_y_prev = xb_g, yb_g
-                    x_left, x_right = xb_g, xb_g + self.lane_width_px
-                    if self.poly_deg is not None:
-                        self.left_coef, self.left_mask = _fit(full[idx]), full[idx]
-                        self.right_coef, self.right_mask = None, None
-                else:
-                    self.right_x_prev, self.right_y_prev = xb_g, yb_g
-                    x_right, x_left = xb_g, xb_g - self.lane_width_px
-                    if self.poly_deg is not None:
-                        self.left_coef, self.left_mask = None, None
-                        self.right_coef, self.right_mask = _fit(full[idx]), full[idx]
-                        
-                self.center_raw = (x_left + x_right) / 2.0
-            except Exception as e:
-                print(f"싱글 차선 처리 중 오류: {e}")
-                return self.center_px
+            # 왼쪽/오른쪽 분리
+            (coef1, x1, y_range1), (coef2, x2, y_range2) = infos
+            print(f"두 차선 감지됨: x1={x1:.1f}, x2={x2:.1f}")
             
-            # FPS 계산
-            current_time = time.time()
-            elapsed = current_time - self.last_update_time
-            self.last_update_time = current_time
-            self.fps = 1.0 / elapsed if elapsed > 0 else 0
-            
-            return self._apply_ema()
-        except Exception as e:
-            print(f"차선 업데이트 중 오류: {e}")
+            if x1 < x2:
+                self.left_coef, self.right_coef = coef1, coef2
+                self.left_y_range, self.right_y_range = y_range1, y_range2
+                x_left, x_right = x1, x2
+            else:
+                self.left_coef, self.right_coef = coef2, coef1
+                self.left_y_range, self.right_y_range = y_range2, y_range1
+                x_left, x_right = x2, x1
+            self.center_px = (x_left + x_right) / 2.0
+            print(f"차선 중앙: {self.center_px:.1f}")
             return self.center_px
 
-    def _apply_ema(self):
-        """중앙 위치에 EMA 스무딩을 적용합니다."""
-        if self.center_raw is None:
+        # ──────────────────────────────────────────
+        # CASE 1 : 한 개만 검출
+        # ──────────────────────────────────────────
+        idx = idx_sorted[0]
+        coef_new, x_new, y_range_new = self._mask_to_poly_bottom(full_bin[idx])
+        if coef_new is None:
+            print("⚠️ 다항식 피팅 실패 (단일 마스크)")
             return self.center_px
 
-        if self.ema_alpha is None or self.center_px is None:
-            self.center_px = self.center_raw
-        else:
-            a = self.ema_alpha
-            self.center_px = a * self.center_raw + (1 - a) * self.center_px
+        print(f"단일 차선 감지됨: x={x_new:.1f}")
+        
+        # (1) 새 차선이 이전 왼/오 중 어느 쪽과 가까운지 계산
+        dist_left = abs(x_new - np.polyval(self.left_coef, H_img-1)) if self.left_coef is not None else np.inf
+        dist_right = abs(x_new - np.polyval(self.right_coef, H_img-1)) if self.right_coef is not None else np.inf
 
+        if dist_left < dist_right:          # 왼쪽 차선으로 간주
+            print(f"왼쪽 차선으로 판단됨 (거리: left={dist_left:.1f}, right={dist_right:.1f})")
+            self.left_coef = coef_new
+            self.left_y_range = y_range_new
+            x_left = x_new
+            x_right = x_left + self.lane_width_px
+            self.right_coef = None          # 추후 갱신 예정
+            self.right_y_range = None
+        else:                               # 오른쪽 차선
+            print(f"오른쪽 차선으로 판단됨 (거리: left={dist_left:.1f}, right={dist_right:.1f})")
+            self.right_coef = coef_new
+            self.right_y_range = y_range_new
+            x_right = x_new
+            x_left = x_right - self.lane_width_px
+            self.left_coef = None
+            self.left_y_range = None
+
+        self.center_px = (x_left + x_right) / 2.0
+        print(f"추정된 차선 중앙: {self.center_px:.1f}")
         return self.center_px
+        
+def draw_polyline(img, coef, color, thickness=3, n_pts=50, y_range=None, roi_offset_y=0):
+    """
+    img      : BGR 영상 (in-place 로 그려짐)
+    coef     : np.ndarray (x = f(y) 다항식 계수)
+    color    : (B,G,R)
+    roi_offset_y : ROI의 y축 오프셋
+    """
+    if coef is None:
+        return
+
+    H, W = img.shape[:2]
+    if y_range is not None:
+        y_min, y_max = y_range
+    else:
+        y_min, y_max = 0, H-1
+    ys = np.linspace(y_min, y_max, n_pts)
+    xs = np.polyval(coef, ys)
+
+    # 이미지 경계 바깥은 버림
+    pts = np.stack([xs, ys + roi_offset_y], axis=-1)  # ROI offset 적용
+    pts = pts[(pts[:,0] >= 0) & (pts[:,0] < W)]   # x in [0, W)
+    if len(pts) < 2:              # 선 최소 2점
+        return
+
+    cv2.polylines(
+        img,
+        [pts.astype(int)],
+        isClosed=False,
+        color=color,
+        thickness=thickness,
+        lineType=cv2.LINE_AA
+    )
     
-    def draw_polyline_masked(self, img, coef, mask_bin, color, thickness=3, y_offset=0):
-        """
-        마스크 영역에 맞춰 다항식으로 차선을 그립니다.
-        """
-        if coef is None or mask_bin is None:
-            return
-            
-        H, W = img.shape[:2]
-        
-        # 유효한 행 찾기
-        valid_rows = np.where(np.sum(mask_bin, axis=1) > 0)[0]
-        if len(valid_rows) == 0:
-            return
-            
-        # 다항식으로 곡선 그리기
-        try:
-            y_min, y_max = np.min(valid_rows), np.max(valid_rows)
-            y_points = np.linspace(y_min, y_max, 20)
-            x_points = np.polyval(coef, y_points)
-            
-            # 이미지 내부의 점만 유지
-            valid_points = []
-            for x, y in zip(x_points, y_points):
-                x_int, y_int = int(x), int(y + y_offset)
-                if 0 <= x_int < W and 0 <= y_int < H:
-                    valid_points.append((x_int, y_int))
-            
-            if len(valid_points) >= 2:
-                # 점들을 연결하는 선 그리기
-                for i in range(1, len(valid_points)):
-                    cv2.line(img, valid_points[i-1], valid_points[i], color, thickness, cv2.LINE_AA)
-        except Exception as e:
-            print(f"곡선 그리기 오류: {e}")
-    
-    def visualize_lanes(self, frame, deviation=0.0, steering=0.0, roi=None):
-        """
-        차선 인식 결과를 시각화합니다.
-        """
-        # 원본 프레임 복사
-        frame_with_lanes = frame.copy()
+    # 점 시각화 추가
+    for pt in pts:
+        cv2.circle(img, (int(pt[0]), int(pt[1])), 2, color, -1)
 
-        y_offset = roi.start if roi else 0
-        
-        # 왼쪽 차선 그리기
-        if self.left_coef is not None and self.left_mask is not None:
-            try:
-                self.draw_polyline_masked(
-                    frame_with_lanes, 
-                    self.left_coef, 
-                    self.left_mask, 
-                    (0, 255, 0),  # 녹색
-                    thickness=3,
-                    y_offset=y_offset
-                )
-            except Exception as e:
-                print(f"왼쪽 차선 그리기 오류: {e}")
-        
-        # 오른쪽 차선 그리기
-        if self.right_coef is not None and self.right_mask is not None:
-            try:
-                self.draw_polyline_masked(
-                    frame_with_lanes, 
-                    self.right_coef, 
-                    self.right_mask, 
-                    (0, 0, 255),  # 빨간색
-                    thickness=3,
-                    y_offset=y_offset
-                )
-            except Exception as e:
-                print(f"오른쪽 차선 그리기 오류: {e}")
-        
-        # 차선 중앙 표시 (인식된 경우)
-        if self.center_px is not None:
-            try:
-                img_center_x = frame.shape[1] // 2
-                
-                # 차선 중앙점 좌표
-                center_point = (int(self.center_px), frame.shape[0] - 30)
-                # 이미지 중앙점 좌표
-                img_center_point = (img_center_x, frame.shape[0] - 30)
-                
-                # 차선 중앙 점 그리기
-                cv2.circle(frame_with_lanes, center_point, 5, (0, 255, 255), -1)  # 노란색 원
-                
-                # 이미지 중앙 점 그리기
-                cv2.circle(frame_with_lanes, img_center_point, 5, (255, 0, 255), -1)  # 핑크색 원
-                
-                # 두 점을 연결하는 선
-                cv2.line(frame_with_lanes, center_point, img_center_point, (255, 255, 255), 2)
-            except Exception as e:
-                print(f"중앙점 그리기 오류: {e}")
-        
-        # 디버깅 정보 표시
-        try:
-            cv2.putText(frame_with_lanes, f"dev:{deviation:.2f} steer:{steering:.2f}", 
-                      (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.9, self.text_color, 2)
-            cv2.putText(frame_with_lanes, f"{self.fps:.1f} FPS", 
-                      (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1.0, self.fps_color, 2)
-        except Exception as e:
-            print(f"텍스트 그리기 오류: {e}")
-        
-        # Lane status display
-        try:
-            lane_status = "Both lanes detected"
-            if self.left_coef is not None and self.right_coef is None:
-                lane_status = "Only left lane detected"
-            elif self.left_coef is None and self.right_coef is not None:
-                lane_status = "Only right lane detected"
-            elif self.left_coef is None and self.right_coef is None:
-                lane_status = "Lane not detected"
-                
-            cv2.putText(frame_with_lanes, lane_status, 
-                      (10, frame.shape[0] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, self.lane_status_color, 2)
-        except Exception as e:
-            print(f"상태 표시 오류: {e}")
-        
-        return frame_with_lanes
-
-class LanePlanner:
-    """검출된 차선 중앙을 기반으로 조향각과 속도를 계획합니다."""
-    
-    def __init__(self):
-        self.MAX_STEER = 0.5
-        self.MAX_SPEED = 0.5
-        self.MIN_SPEED = 0.5
-        self.STRAIGHT_SPEED = 0.33
-        self.TURN_THRESHOLD = 0.15
-
-    def plan(self, lane_center_x, image_center_x):
-        """차선 중앙 위치를 기반으로 조향각과 속도를 계산합니다."""
-        deviation = 0.0
-        steering = 0.0
-        linear_speed = 0.0
-
-        # 차선 중앙이 검출되지 않은 경우
-        if lane_center_x is None:
-            return 0.0, 0.0, 0.0
-
-        # 이미지 중앙으로부터의 편차 계산
-        deviation = (lane_center_x - image_center_x) / image_center_x
-
-        # 편차를 적절한 범위로 제한
-        deviation = np.clip(deviation, -1.0, 1.0)
-
-        # 편차에 비례한 조향각 계산
-        steering = self.MAX_STEER * deviation
-        steering = np.clip(steering, -self.MAX_STEER, self.MAX_STEER)
-
-        # 조향각에 따른 선형 속도 결정
-        if abs(steering) > 0.08:  # 작은 오차 허용 범위
-            linear_speed = self.MIN_SPEED  # 회전 시 속도
-        else:
-            linear_speed = self.STRAIGHT_SPEED  # 직진 시 속도
-
-        # 선형 속도 제한
-        linear_speed = np.clip(linear_speed, -self.MAX_SPEED, self.MAX_SPEED)
-
-        return linear_speed, steering, deviation
+def draw_transparent_box(frame, x1, y1, x2, y2, color, alpha=0.3):
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (x1, y1), (x2, y2), color, -1)
+    cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
+    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
 
 def main():
-    # 명령행 인자 파싱
-    parser = argparse.ArgumentParser(description='Mac용 차선 인식 테스트')
-    parser.add_argument('--source', type=str, default='0', 
-                        help='영상 소스 (0: 웹캠, 파일명: 비디오 파일)')
-    parser.add_argument('--model', type=str, default='lane.pt',
-                        help='YOLO 모델 경로')
-    parser.add_argument('--width', type=int, default=DEFAULT_CAMERA_WIDTH,
-                        help='카메라/비디오 너비')
-    parser.add_argument('--height', type=int, default=DEFAULT_CAMERA_HEIGHT,
-                        help='카메라/비디오 높이')
-    parser.add_argument('--skip', type=int, default=2,
-                        help='몇 프레임마다 추론할지 (기본값: 2)')
-    args = parser.parse_args()
-    
-    if not YOLO_AVAILABLE:
-        print("❌ YOLO를 사용할 수 없습니다. 설치 명령: pip install ultralytics torch")
-        return
-    
-    # 비디오 소스 설정
+    device = 0 if torch.cuda.is_available() else "cpu"
+    print(f"디바이스: {device}")
     try:
-        if args.source.isdigit():
-            print(f"웹캠 {args.source}을(를) 사용합니다.")
-            cap = cv2.VideoCapture(int(args.source))
-        else:
-            print(f"비디오 파일 {args.source}을(를) 사용합니다.")
-            cap = cv2.VideoCapture(args.source)
-        
-        # 해상도 설정
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
-        
-        if not cap.isOpened():
-            raise ValueError("비디오 소스를 열 수 없습니다.")
-            
-        # 실제 적용된 해상도 확인
-        actual_width = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
-        actual_height = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
-        print(f"카메라 해상도: {int(actual_width)}x{int(actual_height)}")
-        
+        print("YOLO 모델 로딩 중...")
+        model = YOLO("lane.pt")
+        model.fuse()
+        print("✅ YOLO 모델 로드 성공")
+        print(f"클래스 이름: {model.names}")
     except Exception as e:
-        print(f"비디오 소스 초기화 오류: {e}")
+        print(f"❌ YOLO 모델 로드 실패: {e}")
+        print(f"현재 작업 디렉토리: {os.getcwd()}")
+        print("lane.pt 파일이 있는지 확인하세요")
         return
-    
-    # YOLO 모델 로드
+
+    print(f"카메라 초기화 중... ({CAMERA_WIDTH}x{CAMERA_HEIGHT} @ {CAMERA_FPS}fps)")
     try:
-        print(f"YOLO 모델을 로드하는 중: {args.model}")
-        if not os.path.exists(args.model):
-            print(f"❌ 모델 파일을 찾을 수 없음: {args.model}")
-            return
-            
-        device = "cpu"  # Mac에서는 CPU 사용
-        model = YOLO(args.model).to(device)
-        print(f"✅ YOLO 모델 로드 완료 (device: {device})")
-        
-        # 마스크가 있는지 확인하기 위한 테스트 추론
-        print("🔍 테스트 추론 실행 중...")
-        ret, test_frame = cap.read()
-        if not ret:
-            print("❌ 테스트 프레임을 읽을 수 없음")
-            return
-            
-        # 30초 제한으로 테스트 추론
-        results = model.predict(test_frame, conf=0.25, verbose=False)
-        print(f"✅ 테스트 추론 완료!")
-        
-        # 마스크 확인
-        if results[0].masks is None:
-            print("⚠️ 경고: 모델이 마스크를 반환하지 않습니다. 차선 감지가 동작하지 않을 수 있습니다.")
-        
+        camera = CSICamera(width=CAMERA_WIDTH, height=CAMERA_HEIGHT, capture_fps=CAMERA_FPS)
+        camera.running = True
     except Exception as e:
-        print(f"❌ 모델 로드 또는 테스트 추론 실패: {e}")
-        print("모델 파일이 올바른지 확인하세요.")
-        traceback.print_exc()
+        print(f"❌ 카메라 초기화 실패: {e}")
         return
-    
-    # 모듈 초기화
-    perception = LanePerception()
-    planner = LanePlanner()
-    
-    print("🚗 차선 인식 테스트 시작 - q 키를 눌러 종료")
+
+    print("카메라가 준비될 때까지 대기 중...")
+    wait_start = time.time()
+    while camera.value is None:
+        if time.time() - wait_start > 5.0:  # 5초 타임아웃
+            print("⚠️ 카메라 초기화 타임아웃!")
+            return
+        time.sleep(0.1)
+    print("✅ 카메라 준비됨")
+
+    prev_t = time.time()
+    tracker = LaneCenterTracker(lane_width_px=LANE_WIDTH_PX, poly_deg=POLY_DEG)
     
     frame_count = 0
-    start_time = time.time()
-    last_results = None
-    
-    try:
-        while True:
-            # 프레임 읽기
-            ret, frame = cap.read()
-            if not ret:
-                print("❌ 프레임 읽기 실패")
-                if not args.source.isdigit():
-                    print("비디오 파일을 처음으로 되감습니다.")
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                    continue
-                break
+    while True:
+        frame = camera.value
+
+        if frame is None:
+            time.sleep(0.01)
+            continue
+
+        frame_count += 1
+        current_time = time.time()
+        fps = 1.0 / (current_time - prev_t) if current_time - prev_t > 0 else 0
+        prev_t = current_time
+        
+        if frame_count % 30 == 0:  # 30 프레임마다 정보 출력
+            print(f"\n프레임 #{frame_count} | FPS: {fps:.1f}")
+
+        H_img, W_img = frame.shape[:2]
+        roi = get_roi_slice(H_img)  # 설정 모듈의 함수 사용
+        
+        # ROI 표시 이미지
+        roi_vis = frame.copy()
+        cv2.line(roi_vis, (0, roi.start), (W_img, roi.start), (0, 255, 0), 2)
+        cv2.putText(roi_vis, f"ROI (y={roi.start})", (10, roi.start-10), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        
+        # 3-A) YOLO 추론
+        try:
+            results = model.predict(frame, device=device, conf=0.3)  # 낮은 신뢰도로 설정
+        except Exception as e:
+            print(f"❌ YOLO 예측 오류: {e}")
+            continue
+
+        # 결과
+        r = results[0]
+        center_x = tracker.update(r, roi=roi)
+        
+        # ROI 영역에서의 처리 결과 시각화
+        frame_roi = frame[roi].copy()
+        
+        # 원래 이미지에 차선 그리기
+        display_frame = frame.copy()
+        
+        # 왼쪽/오른쪽 차선 그리기
+        if tracker.left_coef is not None:
+            draw_polyline(display_frame, tracker.left_coef, (0, 255, 0), y_range=tracker.left_y_range, roi_offset_y=roi.start)
+            cv2.putText(display_frame, "Left lane", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        
+        if tracker.right_coef is not None:
+            draw_polyline(display_frame, tracker.right_coef, (0, 0, 255), y_range=tracker.right_y_range, roi_offset_y=roi.start)
+            cv2.putText(display_frame, "Right lane", (50, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        
+        # 차선 중앙 표시
+        if center_x is not None:
+            img_center_x = W_img // 2
             
-            # 프레임 카운트 증가
-            frame_count += 1
+            # 차선 중앙점 그리기
+            cv2.circle(display_frame, (int(center_x), H_img-30), 8, (0, 255, 255), -1)
+            cv2.putText(display_frame, f"Lane center: {center_x:.1f}", (int(center_x) + 10, H_img-30), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
             
-            # ROI 계산
-            roi = get_roi_slice(frame.shape[0])
+            # 이미지 중앙점 그리기
+            cv2.circle(display_frame, (img_center_x, H_img-30), 8, (255, 0, 255), -1)
+            cv2.putText(display_frame, f"Image center: {img_center_x}", (img_center_x + 10, H_img-60), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
             
-            # 몇 프레임마다 추론
-            if frame_count % args.skip == 0:
-                try:
-                    # YOLO 추론
-                    results = model.predict(frame, conf=0.25, verbose=False)
-                    last_results = results
-                except Exception as e:
-                    print(f"❌ 추론 중 오류: {e}")
-                    # 오류 발생 시 이전 결과 사용
+            # 두 점을 연결하는 선
+            cv2.line(display_frame, (int(center_x), H_img-30), (img_center_x, H_img-30), (255, 255, 255), 2)
             
-            # 차선 감지
-            if last_results is not None:
-                # 이미지 중앙 x 좌표 계산
-                img_center_x = frame.shape[1] // 2
-                
-                # 차선 중앙 업데이트
-                lane_center_x = perception.update(last_results, roi=roi)
-                
-                # 속도 및 조향각 계획
-                linear_speed, steering, deviation = planner.plan(lane_center_x, img_center_x)
-                
-                # 시각화
-                frame_with_lanes = perception.visualize_lanes(frame, deviation, steering, roi)
-                
-                # 결과 이미지 출력
-                cv2.imshow("Lane Detection", frame_with_lanes)
-                
-                # ROI 영역 표시
-                roi_y = roi.start
-                roi_frame = frame.copy()
-                cv2.line(roi_frame, (0, roi_y), (roi_frame.shape[1], roi_y), (255, 0, 0), 2)
-                cv2.imshow("ROI", roi_frame[roi])
-            else:
-                # 결과가 없는 경우 원본 프레임만 표시
-                cv2.imshow("Lane Detection", frame)
+            # 편차 계산 및 표시
+            deviation = (center_x - img_center_x) / img_center_x
+            deviation_text = f"Deviation: {deviation:.2f}"
+            cv2.putText(display_frame, deviation_text, (50, 110), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 255), 2)
+        
+        # 다른 정보 표시
+        lane_status = "상태: "
+        if tracker.left_coef is not None and tracker.right_coef is not None:
+            lane_status += "양쪽 차선 감지됨"
+        elif tracker.left_coef is not None:
+            lane_status += "왼쪽 차선만 감지됨"
+        elif tracker.right_coef is not None:
+            lane_status += "오른쪽 차선만 감지됨"
+        else:
+            lane_status += "차선 감지 안됨"
             
-            # 키 입력 처리
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord('q'):
-                break
-    
-    except KeyboardInterrupt:
-        print("\n테스트가 Ctrl+C로 중단되었습니다.")
-    except Exception as e:
-        print(f"\n테스트 중 오류 발생: {e}")
-        traceback.print_exc()
-    finally:
-        # 정리
-        cap.release()
-        cv2.destroyAllWindows()
-        print("🚗 테스트 종료")
+        cv2.putText(display_frame, lane_status, (50, 140), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        cv2.putText(display_frame, f"FPS: {fps:.1f}", (50, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        
+        # 3-B) 박스 그리기
+        boxes = r.boxes
+        if len(boxes) > 0:
+            clss = boxes.cls.cpu().numpy()
+            confs = boxes.conf.cpu().numpy()
+            xyxy = boxes.xyxy.cpu().numpy()
+            
+            for (x1, y1, x2, y2), cls_id, conf in zip(xyxy, clss, confs):
+                label = f"{model.names[int(cls_id)]} {conf:.2f}"
+                p1, p2 = (int(x1), int(y1)), (int(x2), int(y2))
+                cv2.rectangle(display_frame, p1, p2, (0, 255, 255), 2)
+                cv2.putText(display_frame, label, (p1[0], p1[1]-8),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+
+        # 마스크 디버그 이미지 표시
+        if tracker.debug_masks is not None:
+            cv2.imshow("Masks Debug", tracker.debug_masks)
+
+        cv2.imshow("YOLO-Detect", display_frame)
+        cv2.imshow("Lane-ROI", frame_roi)
+        cv2.imshow("ROI Visualization", roi_vis)
+        
+        if cv2.waitKey(1) & 0xFF in (ord('q'), ord('Q')):
+            print("종료 신호 받음")
+            break
+
+    # Release camera resources
+    print("카메라 리소스 정리 중...")
+    camera.running = False
+    # Attempt to explicitly release the underlying capture object
+    if hasattr(camera, 'cap') and hasattr(camera.cap, 'release'):
+        print("camera.cap 해제 시도...")
+        camera.cap.release()
+        print("✅ camera.cap 해제됨")
+    # Explicitly delete the camera object to ensure resource release
+    del camera
+    cv2.destroyAllWindows()
+    print("카메라 정지됨")
 
 if __name__ == "__main__":
+    import os
     main()

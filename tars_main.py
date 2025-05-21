@@ -87,7 +87,7 @@ def main():
             frame_with_lanes = perception.visualize_lanes(frame, deviation, steering, roi)
             
             # 결과 이미지 출력
-            # cv2.imshow("YOLO-AutoDrive", frame_with_lanes)
+            cv2.imshow("YOLO-AutoDrive", frame_with_lanes)
 
             # 키 입력 처리
             key = cv2.waitKey(1) & 0xFF
@@ -120,6 +120,7 @@ def print_menu():
     print("mt: 메뉴얼 (Terminal) - 비디오 녹화 포함")
     print("c: 카메라 테스트")
     print("cc: 카메라 사진 캡쳐")
+    print("cal: 차선 폭 칼리브레이션")
     print("q: 정지 및 메뉴로")
     print("x: 종료")
     print("====================")
@@ -128,7 +129,7 @@ def print_menu():
 def main_menu():
     while True:
         print_menu()
-        mode = input("모드 선택 (a/mp/mt/c/cc/q/x): ").strip().lower()
+        mode = input("모드 선택 (a/mp/mt/c/cc/cal/q/x): ").strip().lower()
 
         if mode == 'a':
             main()  # 자율주행 모드 실행
@@ -146,6 +147,8 @@ def main_menu():
             run_camera_test()
         elif mode == 'cc':
             capture_photo()
+        elif mode == 'cal':
+            run_calibration()
         elif mode == 'q':
             base.base_velocity_ctrl(0, 0)
             print("정지 및 메뉴로 돌아갑니다.")
@@ -158,24 +161,35 @@ def main_menu():
 
 # 카메라 테스트 함수
 def run_camera_test():
-    camera_manager = CameraManager.get_instance()
-    camera_manager.initialize_camera()
-    
-    print("카메라 테스트 중... 'q' 키를 눌러 종료하세요.")
-    
     try:
-        while True:
-            frame = camera_manager.get_frame()
-            if frame is not None:
-                cv2.imshow("Camera Test", frame)
-                if cv2.waitKey(1) & 0xFF == ord('q'):
-                    break
-            else:
-                print("프레임을 읽을 수 없습니다.")
-                time.sleep(0.1)
-    finally:
-        camera_manager.release_camera()
-        cv2.destroyAllWindows()
+        import tars_camera_test
+        tars_camera_test.camera_test_main()
+    except Exception as e:
+        import traceback
+        print(f"카메라 테스트 실행 중 오류 발생: {e}")
+        print("상세 오류 정보:")
+        traceback.print_exc()
+        print("\n기본 카메라 테스트로 대체합니다.")
+        
+        # 기본 카메라 테스트로 대체
+        camera_manager = CameraManager.get_instance()
+        camera_manager.initialize_camera()
+        
+        print("카메라 테스트 중... 'q' 키를 눌러 종료하세요.")
+        
+        try:
+            while True:
+                frame = camera_manager.get_frame()
+                if frame is not None:
+                    cv2.imshow("Camera Test", frame)
+                    if cv2.waitKey(1) & 0xFF == ord('q'):
+                        break
+                else:
+                    print("프레임을 읽을 수 없습니다.")
+                    time.sleep(0.1)
+        finally:
+            camera_manager.release_camera()
+            cv2.destroyAllWindows()
 
 # 사진 캡쳐 함수
 def capture_photo():
@@ -208,6 +222,18 @@ def capture_photo():
         print("❌ 프레임을 캡쳐할 수 없습니다.")
     
     camera_manager.release_camera()
+
+# 칼리브레이션 실행 함수
+def run_calibration():
+    try:
+        import tars_calibration
+        tars_calibration.main()
+    except Exception as e:
+        import traceback
+        print(f"칼리브레이션 실행 중 오류 발생: {e}")
+        print("상세 오류 정보:")
+        traceback.print_exc()
+        print("\n칼리브레이션이 실패했습니다.")
 
 # 스크립트 직접 실행 시 main_menu() 호출
 if __name__ == "__main__":
