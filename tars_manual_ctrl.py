@@ -256,7 +256,7 @@ class TerminalKeyboardController(BaseManualController):
             )
 
             fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            self.video_writer = cv2.VideoWriter(self.video_filepath, fourcc, FPS, (WIDTH, HEIGHT))
+            self.video_writer = cv2.VideoWriter(self.video_filepath, fourcc, CAMERA_FPS, (CAMERA_WIDTH, CAMERA_HEIGHT))
 
             if not self.video_writer.isOpened():
                 print(f"❌ VideoWriter open failed for {self.video_filepath}")

@@ -82,7 +82,7 @@ def main(display_mode=True):
                 continue
 
             # 이미지 중앙 x 좌표 계산
-            img_center_x = (frame.shape[1] // 2) - 11
+            img_center_x = (frame.shape[1] // 2)
 
             roi = get_roi_slice(frame.shape[0]) 
 
