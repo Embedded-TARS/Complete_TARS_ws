@@ -6,7 +6,7 @@
 
 # 필요한 모듈 임포트
 from tars_perception import LanePerception, LaneDetectionModel
-from tars_planning import LanePlanner
+from tars_planning import EnhancedLanePlanner, CLASS_INFO
 from tars_control import RobotController
 from tars_camera import CameraManager
 from base_ctrl_js import BaseController
@@ -81,7 +81,7 @@ def main(display_mode=True):
     # 자율주행 모듈 및 카메라 초기화
     lane_model = LaneDetectionModel(model_path="lane.pt", lane_class_id=12)
     perception = LanePerception(lane_width_px=LANE_WIDTH_PX, ema_alpha=EMA_ALPHA)
-    planner = LanePlanner()
+    planner = EnhancedLanePlanner(model_path="obj.pt")
     controller = RobotController(base)
     camera_manager = CameraManager.get_instance()
     camera_manager.initialize_camera(width=CAMERA_WIDTH, height=CAMERA_HEIGHT, capture_fps=CAMERA_FPS)
@@ -111,29 +111,40 @@ def main(display_mode=True):
 
             # Perception: YOLO 추론 및 차선 감지
             results = lane_model.predict(frame)
-            lane_center_x = perception.update(results[0], roi = roi)
-            
-            # 상태 정보 준비
-            status = [
-                "=== 자율주행 상태 ===",
-                f"차선 중심점: {lane_center_x:.2f}" if lane_center_x is not None else "차선 감지: ❌ (차선을 찾을 수 없음)",
-                f"이미지 중심점: {img_center_x}",
-                f"상태: {'일시정지' if is_paused else '주행중'}",
-                "조작: q(종료), 스페이스(일시정지/재시작)",
-                "==================="
-            ]
-            
-            # 깨끗한 상태 출력
-            print_status_clean(status)
+            lane_center_x = perception.update(results[0], roi=roi)
 
             # Planning: 속도 및 스티어링 결정
             if lane_center_x is not None:
-                linear_speed, steering, deviation = planner.plan(lane_center_x, img_center_x)
+                linear_speed, steering, deviation, state, detected_objects = planner.plan_with_objects(frame, lane_center_x, img_center_x)
             else:
                 # 차선이 감지되지 않았을 때는 천천히 직진
                 linear_speed = 0.3  # 낮은 속도
                 steering = 0.0      # 직진
                 deviation = 0.0
+                state = "no_lane_detected"
+                detected_objects = []
+
+            # 상태 정보 준비 - 항상 표시
+            status = [
+                "=== 자율주행 상태 ===",
+                f"차선 중심점: {lane_center_x:.2f}" if lane_center_x is not None else "차선 감지: ❌ (차선을 찾을 수 없음)",
+                f"이미지 중심점: {img_center_x}",
+                f"현재 상태: {state}",
+                f"검출된 객체 수: {len(detected_objects)}",
+                f"주행 상태: {'일시정지' if is_paused else '주행중'}",
+                "조작: q(종료), 스페이스(일시정지/재시작)"
+            ]
+            
+            # 검출된 객체 정보 추가
+            if detected_objects:
+                status.append("검출된 객체 정보:")
+                for obj in detected_objects:
+                    status.append(f" - 클래스: {CLASS_INFO[obj['class']]['name']}, 신뢰도: {obj['confidence']:.2f}, 영역: {obj['area']}")
+            
+            status.append("==================")
+            
+            # 깨끗한 상태 출력
+            print_status_clean(status)
 
             # Control: 로봇에 제어 명령 전송 (일시정지 상태가 아닐 때만)
             if not is_paused:
