@@ -40,9 +40,9 @@ base = BaseController(port, 115200)
 
 # 터미널 설정을 위한 함수들
 def set_terminal_mode():
-    """터미널을 raw 모드로 설정"""
+    """터미널을 cbreak 모드로 설정 (raw 모드보다 덜 제한적)"""
     old_settings = termios.tcgetattr(sys.stdin)
-    tty.setraw(sys.stdin.fileno())
+    tty.setcbreak(sys.stdin.fileno())  # raw 대신 cbreak 사용
     return old_settings
 
 def restore_terminal_mode(old_settings):
@@ -57,6 +57,26 @@ def get_key():
     """키 입력을 읽음"""
     return sys.stdin.read(1)
 
+def clear_screen():
+    """화면을 깨끗하게 클리어"""
+    print("\033[H\033[2J", end="", flush=True)
+
+def print_status_clean(status_lines):
+    """상태를 깨끗하게 출력"""
+    # 커서를 맨 위로 이동하고 화면 클리어
+    print("\033[H", end="")
+    
+    # 각 줄을 출력하고 줄 끝까지 클리어
+    for line in status_lines:
+        print(f"{line}\033[K")  # \033[K는 커서부터 줄 끝까지 클리어
+    
+    # 추가 빈 줄들도 클리어 (이전 출력이 더 길었을 경우를 대비)
+    for _ in range(5):
+        print("\033[K")
+    
+    # 커서를 다시 상태 출력 아래로 이동
+    print(f"\033[{len(status_lines)+1}H", end="", flush=True)
+
 def main(display_mode=True):
     # 자율주행 모듈 및 카메라 초기화
     lane_model = LaneDetectionModel(model_path="lane.pt", lane_class_id=12)
@@ -70,8 +90,11 @@ def main(display_mode=True):
     
     is_paused = False  # 일시정지 상태를 추적하는 변수
     
-    # 터미널 설정 변경
+    # 터미널 설정 변경 - cbreak 모드 사용
     old_terminal_settings = set_terminal_mode()
+    
+    # 초기 화면 클리어
+    clear_screen()
     
     try:
         while True:
@@ -90,21 +113,18 @@ def main(display_mode=True):
             results = lane_model.predict(frame)
             lane_center_x = perception.update(results[0], roi = roi)
             
-            # 출력 정리
-            sys.stdout.write('\033[2J\033[H')  # 화면 클리어 및 커서를 맨 위로
-            sys.stdout.flush()
-            
+            # 상태 정보 준비
             status = [
                 "=== 자율주행 상태 ===",
                 f"차선 중심점: {lane_center_x:.2f}" if lane_center_x is not None else "차선 감지: ❌ (차선을 찾을 수 없음)",
                 f"이미지 중심점: {img_center_x}",
                 f"상태: {'일시정지' if is_paused else '주행중'}",
+                "조작: q(종료), 스페이스(일시정지/재시작)",
                 "==================="
             ]
             
-            # 한 번에 모든 상태 출력
-            sys.stdout.write('\n'.join(status) + '\n')
-            sys.stdout.flush()
+            # 깨끗한 상태 출력
+            print_status_clean(status)
 
             # Planning: 속도 및 스티어링 결정
             if lane_center_x is not None:
@@ -133,15 +153,15 @@ def main(display_mode=True):
                 # 결과 이미지 출력
                 cv2.imshow("YOLO-AutoDrive", frame_with_lanes)
 
-            # 키 입력 처리 (터미널과 OpenCV 모두)
+            # 키 입력 처리 - 논블로킹 방식
             if is_key_pressed():
                 key = get_key()
                 if key == 'q':
                     break
                 elif key == ' ':  # 스페이스바
                     is_paused = not is_paused
-                    sys.stdout.write("\n⏸️ 일시정지\n" if is_paused else "\n▶️ 재시작\n")
-                    sys.stdout.flush()
+                    # 상태 변경 알림을 화면 하단에 출력
+                    print(f"\n{'⏸️  일시정지 상태' if is_paused else '▶️  주행 재시작'}")
             
             # OpenCV 창의 키 입력도 처리 (디스플레이 모드가 활성화된 경우에만)
             if display_mode:
@@ -150,16 +170,19 @@ def main(display_mode=True):
                     break
                 elif key == 32:  # 스페이스바
                     is_paused = not is_paused
-                    sys.stdout.write("\n⏸️ 일시정지\n" if is_paused else "\n▶️ 재시작\n")
-                    sys.stdout.flush()
+                    print(f"\n{'⏸️  일시정지 상태' if is_paused else '▶️  주행 재시작'}")
 
     except KeyboardInterrupt:
-        print("\n자율주행 모드가 Ctrl+C로 중단되었습니다.")
+        print("\n\n자율주행 모드가 Ctrl+C로 중단되었습니다.")
     except Exception as e:
-        print(f"\n자율주행 모드 오류: {e}")
+        print(f"\n\n자율주행 모드 오류: {e}")
     finally:
         # 터미널 설정 복구
         restore_terminal_mode(old_terminal_settings)
+        
+        # 화면 클리어 후 종료 메시지
+        clear_screen()
+        print("🚗 자율주행 종료\n")
         
         # 자율주행 종료 시 정리 작업
         camera_manager.release_camera()
@@ -172,8 +195,6 @@ def main(display_mode=True):
         # Add a shutdown call for the base controller if implemented
         if hasattr(base, 'shutdown'):
             base.shutdown()
-            
-        print("🚗 자율주행 종료")
 
 # 메인 메뉴 출력 함수
 def print_menu():
