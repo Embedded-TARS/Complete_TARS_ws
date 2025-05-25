@@ -124,26 +124,22 @@ def main(display_mode=True):
                 state = "no_lane_detected"
                 detected_objects = []
 
-            # 상태 정보 준비 - 항상 표시
+            # 상태 정보 준비 - 간소화된 버전
             status = [
                 "=== 자율주행 상태 ===",
-                f"차선 중심점: {lane_center_x:.2f}" if lane_center_x is not None else "차선 감지: ❌ (차선을 찾을 수 없음)",
-                f"이미지 중심점: {img_center_x}",
-                f"현재 상태: {state}",
-                f"검출된 객체 수: {len(detected_objects)}",
-                f"주행 상태: {'일시정지' if is_paused else '주행중'}",
-                "조작: q(종료), 스페이스(일시정지/재시작)"
+                f"상태: {state}",
+                f"속도: {linear_speed:.2f} m/s",
+                f"조향: {steering:.2f} rad/s",
+                f"주행: {'일시정지' if is_paused else '주행중'}"
             ]
             
-            # 검출된 객체 정보 추가
+            # 객체가 검출된 경우에만 추가 정보 표시
             if detected_objects:
-                status.append("검출된 객체 정보:")
+                status.append(f"객체: {len(detected_objects)}개")
                 for obj in detected_objects:
-                    status.append(f" - 클래스: {CLASS_INFO[obj['class']]['name']}, 신뢰도: {obj['confidence']:.2f}, 영역: {obj['area']}")
+                    if obj['confidence'] > 0.5:  # 신뢰도가 50% 이상인 객체만 표시
+                        status.append(f"- {CLASS_INFO[obj['class']]['name']} ({obj['confidence']:.0%})")
             
-            status.append("==================")
-            
-            # 깨끗한 상태 출력
             print_status_clean(status)
 
             # Control: 로봇에 제어 명령 전송 (일시정지 상태가 아닐 때만)

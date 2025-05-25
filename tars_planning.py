@@ -28,41 +28,42 @@ CLASS_INFO = {
 
 class EnhancedLanePlanner:
     def __init__(self, model_path="obj.pt"):
-        # 기존 파라미터
         self.MAX_STEER = MAX_STEER
         self.MAX_SPEED = MAX_SPEED
         self.MIN_SPEED = MIN_SPEED
         self.STRAIGHT_SPEED = STRAIGHT_SPEED
         self.TURN_THRESHOLD = TURN_THRESHOLD
-        self.WHEELBASE = WHEELBASE
-        self.LOOKAHEAD_DISTANCE = LOOKAHEAD_DISTANCE
         
-        # 객체 검출 관련 파라미터
+        # Pure Pursuit 매개변수 조정 - 더 민감한 조향을 위해
+        self.WHEELBASE = 0.1  # 기존보다 작게 설정
+        self.LOOKAHEAD_DISTANCE = 0.3  # 기존보다 작게 설정
+        
         self.device = 0 if torch.cuda.is_available() else "cpu"
         self.sign_model = YOLO(model_path).to(self.device)
         self.vehicle_classes = [5, 6, 7]  # car, bus, motorcycle
         self.min_detection_area = 5000
         
-        # 상태 추적 변수
         self.last_seen_sign = None
         self.last_action_time = 0
         self.SIGN_COOLDOWN_SEC = 3
         
-        # 정지 표지판 관련 변수
         self.stop_sign_detected = False
         self.stop_start_time = None
         self.last_stop_sign_time = None
-        self.STOP_DURATION = 2  # 정지 시간 (초)
-        self.COOLDOWN_DURATION = 5  # 정지 표지판 쿨다운 시간 (초)
+        self.STOP_DURATION = 2
+        self.COOLDOWN_DURATION = 5
         
-        # 주행 상태
-        self.current_state = "lane_following"  # lane_following, stopping, turning, avoiding
+        self.current_state = "lane_following"
         self.state_start_time = time.time()
         
+        # Pure Pursuit 조향 게인 - 더 민감하게 조정
+        self.STEERING_GAIN = 1.2  # 1.0에서 1.2로 증가
+        self.SPEED_REDUCTION_FACTOR = 0.7  # Factor to reduce speed during turns
+        
         print(f"✅ Enhanced Lane Planner initialized with device: {self.device}")
+        print(f"📊 Pure Pursuit Parameters: WHEELBASE={self.WHEELBASE}, LOOKAHEAD={self.LOOKAHEAD_DISTANCE}")
 
     def detect_objects(self, frame):
-        """프레임에서 객체 검출 수행"""
         det_results = self.sign_model.predict(frame, verbose=False)
         boxes = det_results[0].boxes
         detected_objects = []
@@ -77,29 +78,28 @@ class EnhancedLanePlanner:
                 
                 if area >= self.min_detection_area:
                     detected_objects.append({
-                        "bbox": [x1, y1, x2, y2],
-                        "class": cls_id,
-                        "confidence": conf,
-                        "area": area
+                        'class': cls_id,
+                        'confidence': conf,
+                        'area': area,
+                        'bbox': (x1, y1, x2, y2)
                     })
         
-        return detected_objects, boxes
+        return detected_objects
 
     def process_traffic_light(self, detected_objects, boxes):
-        """신호등 처리 로직"""
         class_ids = [obj["class"] for obj in detected_objects]
         
-        if 8 in class_ids:  # 신호등 감지
+        if 8 in class_ids:
             has_red = has_yellow = has_green = False
             
             if boxes is not None:
                 for i in range(len(boxes)):
                     cls_id = int(boxes[i].cls[0].item())
-                    if cls_id == 11:    # 빨간불
+                    if cls_id == 11:
                         has_red = True
-                    elif cls_id == 10:  # 노란불
+                    elif cls_id == 10:
                         has_yellow = True
-                    elif cls_id == 9:   # 초록불
+                    elif cls_id == 9:
                         has_green = True
             
             if has_red:
@@ -118,51 +118,61 @@ class EnhancedLanePlanner:
         return None, None
 
     def process_traffic_signs(self, detected_objects):
-        """교통 표지판 처리 로직"""
         class_ids = [obj["class"] for obj in detected_objects]
         current_time = time.time()
         
-        # 쿨다운 체크
+        # 이전에 감지된 표지판이 있고 쿨다운 시간이 지나지 않았다면 무시
         if (self.last_seen_sign is not None and 
             current_time - self.last_action_time < self.SIGN_COOLDOWN_SEC):
             return None, None
         
-        # 각 표지판별 처리
-        if 0 in class_ids:  # 직진
+        if 0 in class_ids:
             print("✅ 직진 표지판 감지")
             self.last_seen_sign = 0
             self.last_action_time = current_time
             return "straight_sign", None
             
-        elif 1 in class_ids:  # 좌회전
+        elif 1 in class_ids:
             print("✅ 좌회전 표지판 감지")
             self.last_seen_sign = 1
             self.last_action_time = current_time
-            return "left_turn_sign", (self.MIN_SPEED, self.MAX_STEER * 0.8)
+            return "left_turn_sign", (self.MIN_SPEED, -self.MAX_STEER * 0.8)
             
-        elif 2 in class_ids:  # 우회전
+        elif 2 in class_ids:
             print("✅ 우회전 표지판 감지")
             self.last_seen_sign = 2
             self.last_action_time = current_time
-            return "right_turn_sign", (self.MIN_SPEED, -self.MAX_STEER * 0.8)
+            return "right_turn_sign", (self.MIN_SPEED, self.MAX_STEER * 0.8)
             
-        elif 3 in class_ids:  # 보행자
+        elif 3 in class_ids:
+            # 보행자 표지판 처리
+            # 1. 보행자 표지판이 감지되면 최소 속도의 50%로 감속
+            # 2. 조향은 현재 차선을 따라가도록 유지 (None 반환)
             print("✅ 보행자 표지판 감지 - 서행")
             self.last_seen_sign = 3
             self.last_action_time = current_time
-            return "pedestrian_sign", (self.MIN_SPEED * 0.5, None)
+            return "pedestrian_sign", (self.MAX_SPEED * 0.4, None)
             
-        elif 4 in class_ids:  # 정지 표지판
+        elif 4 in class_ids:
+            # 정지 표지판 처리 로직
             if not self.stop_sign_detected:
+                # 1. 처음 정지 표지판을 감지한 경우
+                # - 정지 상태로 전환
+                # - 속도와 조향을 0으로 설정하여 완전 정지
                 print("✅ 정지 표지판 감지 - 완전정지")
                 self.stop_sign_detected = True
                 self.stop_start_time = current_time
                 self.current_state = "stopping"
                 return "stop_sign", (0.0, 0.0)
             elif current_time - self.stop_start_time < self.STOP_DURATION:
+                # 2. 정지 중인 경우 (STOP_DURATION = 2초 동안 정지)
+                # - 계속해서 정지 상태 유지
                 return "stop_sign", (0.0, 0.0)
             else:
+                # 3. 정지 시간이 지난 후 처리
                 if self.last_stop_sign_time is None or current_time - self.last_stop_sign_time > self.COOLDOWN_DURATION:
+                    # 마지막 정지 표지판 감지 후 COOLDOWN_DURATION(5초) 이상 지났으면
+                    # 정지 상태를 해제하고 차선 추종 모드로 복귀
                     print("✅ 정지 완료 - 출발")
                     self.stop_sign_detected = False
                     self.stop_start_time = None
@@ -170,45 +180,35 @@ class EnhancedLanePlanner:
                     self.last_stop_sign_time = current_time
                     return None, None
                 else:
+                    # 쿨다운 기간 중에는 추가 동작 없음
                     return None, None
         
         return None, None
 
-    def process_vehicles(self, detected_objects, image_center_x):
-        """차량 회피 로직"""
-        vehicle_objects = [obj for obj in detected_objects if obj["class"] in self.vehicle_classes]
-        
-        if not vehicle_objects:
-            return None, None
-            
-        largest_vehicle = max(vehicle_objects, key=lambda x: x["area"])
-        x1, y1, x2, y2 = largest_vehicle["bbox"]
-        vehicle_center_x = (x1 + x2) // 2
-        deviation_threshold = image_center_x * 0.3
-        
-        if abs(vehicle_center_x - image_center_x) < deviation_threshold:
-            if vehicle_center_x > image_center_x:
-                print("↩️ 우측 차량 회피 - 좌측으로 이동")
-                return "avoid_right_vehicle", (self.MIN_SPEED, self.MAX_STEER * 0.6)
-            else:
-                print("↪️ 좌측 차량 회피 - 우측으로 이동")
-                return "avoid_left_vehicle", (self.MIN_SPEED, -self.MAX_STEER * 0.6)
-        
-        return None, None
-
     def calculate_lane_following(self, lane_center_x, image_center_x):
-        """기본 차선 추종 로직"""
+        """Pure Pursuit 기반 차선 추종 로직"""
         if lane_center_x is None:
             return 0.0, 0.0, 0.0
         
+        # 편차 계산 (정규화)
         deviation = (lane_center_x - image_center_x) / image_center_x
         deviation = np.clip(deviation, -1.0, 1.0)
         
+        # Pure Pursuit 알고리즘
+        # 목표점까지의 거리 계산
         target_x = self.LOOKAHEAD_DISTANCE * deviation
+        
+        # 조향각 계산 (Pure Pursuit formula)
+        # δ = arctan(2 * L * target_x / ld²)
+        # 여기서 L은 wheelbase, ld는 lookahead distance
         steering_angle = np.arctan2(2 * self.WHEELBASE * target_x, 
                                   self.LOOKAHEAD_DISTANCE**2)
-        steering = np.clip(steering_angle, -self.MAX_STEER, self.MAX_STEER)
         
+        # 조향 게인 적용 및 제한
+        steering = steering_angle * self.STEERING_GAIN
+        steering = np.clip(steering, -self.MAX_STEER, self.MAX_STEER)
+        
+        # 속도 결정 - 조향이 클수록 속도 감소
         if abs(steering) > 0.08:
             linear_speed = self.MIN_SPEED
         else:
@@ -216,13 +216,18 @@ class EnhancedLanePlanner:
             
         linear_speed = np.clip(linear_speed, -self.MAX_SPEED, self.MAX_SPEED)
         
+        # 디버깅 정보 출력 (필요시)
+        if abs(deviation) > 0.1:  # 큰 편차가 있을 때만 출력
+            print(f"🔄 Pure Pursuit: deviation={deviation:.3f}, steering={steering:.3f}, speed={linear_speed:.3f}")
+        
         return linear_speed, steering, deviation
 
     def plan_with_objects(self, frame, lane_center_x, image_center_x):
         """객체 인식을 포함한 전체 계획 수립"""
-        detected_objects, boxes = self.detect_objects(frame)
+        detected_objects = self.detect_objects(frame)
         
-        traffic_result, traffic_control = self.process_traffic_light(detected_objects, boxes)
+        # 신호등 처리
+        traffic_result, traffic_control = self.process_traffic_light(detected_objects, None)
         if traffic_result:
             if traffic_control:
                 speed, steering = traffic_control
@@ -231,6 +236,7 @@ class EnhancedLanePlanner:
                     steering = lane_steering
                 return speed, steering, 0.0, traffic_result, detected_objects
         
+        # 교통표지판 처리
         sign_result, sign_control = self.process_traffic_signs(detected_objects)
         if sign_result:
             if sign_control:
@@ -242,17 +248,12 @@ class EnhancedLanePlanner:
                     deviation = 0.0
                 return speed, steering, deviation, sign_result, detected_objects
         
-        vehicle_result, vehicle_control = self.process_vehicles(detected_objects, image_center_x)
-        if vehicle_result:
-            if vehicle_control:
-                speed, steering = vehicle_control
-                deviation = 0.0
-                return speed, steering, deviation, vehicle_result, detected_objects
-        
+        # 기본 차선 추종
         speed, steering, deviation = self.calculate_lane_following(lane_center_x, image_center_x)
         return speed, steering, deviation, "lane_following", detected_objects
 
     def plan(self, lane_center_x, image_center_x, frame=None):
+        """메인 계획 함수"""
         if frame is not None:
             speed, steering, deviation, state, objects = self.plan_with_objects(frame, lane_center_x, image_center_x)
             return speed, steering, deviation
@@ -260,6 +261,7 @@ class EnhancedLanePlanner:
             return self.calculate_lane_following(lane_center_x, image_center_x)
 
     def get_detection_info(self):
+        """현재 감지 상태 정보 반환"""
         return {
             "last_seen_sign": self.last_seen_sign,
             "last_action_time": self.last_action_time,

@@ -16,30 +16,17 @@ class LaneDetectionModel:
         self.lane_class_id = lane_class_id
         self.device = 0 if torch.cuda.is_available() else "cpu"
         print(f"YOLO 모델을 {self.device}에 로드하는 중...")
-        self.model = YOLO(model_path).to(self.device)
-        print(f"✅ YOLO 모델이 {self.device}에 로드되었습니다.")
+        try:
+            self.model = YOLO(model_path).to(self.device)
+            print(f"✅ YOLO 모델이 {self.device}에 로드되었습니다.")
+        except Exception as e:
+            print(f"❌ 모델 로드 실패: {e}")
+            raise
         self.last_conf = 0.5  # 초기 신뢰도 임계값
         self.conf_history = []  # 신뢰도 이력
     
     def predict(self, frame):
-        # 적응형 신뢰도 임계값 계산
-        if len(self.conf_history) > 0:
-            avg_conf = sum(self.conf_history) / len(self.conf_history)
-            # 이전 프레임의 신뢰도가 낮았으면 임계값을 낮춤
-            if avg_conf < 0.4:
-                self.last_conf = max(0.3, self.last_conf - 0.05)
-            # 이전 프레임의 신뢰도가 높았으면 임계값을 높임
-            elif avg_conf > 0.6:
-                self.last_conf = min(0.5, self.last_conf + 0.05)
-        
-        results = self.model.predict(frame, device=self.device, conf=self.last_conf, iou=0.45)
-        
-        # 현재 프레임의 신뢰도 저장
-        if len(results) > 0 and len(results[0].boxes) > 0:
-            self.conf_history.append(results[0].boxes.conf.mean().item())
-            if len(self.conf_history) > 5:  # 최근 5프레임만 유지
-                self.conf_history.pop(0)
-        
+        results = self.model.predict(frame, device=self.device, conf=0.5, iou=0.45, verbose=False)
         return results
 
 # 이미지 하단 절반을 ROI (관심 영역)로 설정하는 함수

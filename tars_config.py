@@ -10,14 +10,14 @@ CAMERA_HEIGHT = 480
 CAMERA_FPS = 30
 
 # 차선 인식 설정
-ROI_RATIO = 0.7  # ROI 시작 위치 (이미지 높이의 비율)
+ROI_RATIO = 0.6  # ROI 시작 위치 (이미지 높이의 비율)
 LANE_WIDTH_PX = 635  # Calibrated bottom lane width
 MIDDLE_LANE_WIDTH_PX = 478  # Calibrated middle lane width
 POLY_DEG = 3  # 차선 곡선 피팅에 사용할 다항식 차수
 EMA_ALPHA = 0.9  # 차선 중앙 위치 스무딩 계수
 
 # 자율주행 제어 설정
-MAX_STEER = 0.12
+MAX_STEER = 0.3     # 최대 조향 각속도 (rad/s)
 MAX_SPEED = 0.5
 MIN_SPEED = 0.5
 STRAIGHT_SPEED = 0.3
