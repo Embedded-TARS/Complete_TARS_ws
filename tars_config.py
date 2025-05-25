@@ -23,9 +23,9 @@ MIN_DETECTION_AREAS = {
     2: 3000,  # right sign
     3: 3000,  # pedestrian sign
     4: 3000,  # stop sign
-    5: 5000,  # car
-    6: 5000,  # bus
-    7: 5000,  # motorcycle
+    5: 7000,  # car
+    6: 10000,  # bus
+    7: 2000,  # motorcycle
     8: 1000,  # traffic light
     9: 10,  # green light
     10: 10, # yellow light
