@@ -6,7 +6,7 @@ import torch
 from ultralytics import YOLO
 from tars_config import (
     MAX_STEER, MAX_SPEED, MIN_SPEED, STRAIGHT_SPEED, TURN_THRESHOLD,
-    WHEELBASE, LOOKAHEAD_DISTANCE
+    WHEELBASE, LOOKAHEAD_DISTANCE, MIN_DETECTION_AREAS
 )
 
 # 클래스 정보 매핑
@@ -41,17 +41,24 @@ class EnhancedLanePlanner:
         self.device = 0 if torch.cuda.is_available() else "cpu"
         self.sign_model = YOLO(model_path).to(self.device)
         self.vehicle_classes = [5, 6, 7]  # car, bus, motorcycle
-        self.min_detection_area = 5000
+        self.min_detection_areas = MIN_DETECTION_AREAS
         
         self.last_seen_sign = None
         self.last_action_time = 0
-        self.SIGN_COOLDOWN_SEC = 3
+        self.SIGN_COOLDOWN_FRAMES = 60  # 2초 (30fps * 2)
+        self.current_frame_count = 0
         
+        # 정지 표지판 관련 플래그
         self.stop_sign_detected = False
-        self.stop_start_time = None
-        self.last_stop_sign_time = None
-        self.STOP_DURATION = 2
-        self.COOLDOWN_DURATION = 5
+        self.stop_sign_start_frame = 0
+        self.STOP_SIGN_DURATION_FRAMES = 60  # 2초 (30fps * 2)
+        self.stop_sign_cooldown_frames = 150  # 5초 (30fps * 5)
+        self.stop_sign_last_detected_frame = 0
+        
+        # 보행자 표지판 관련 플래그
+        self.is_pedestrian_sign_active = False
+        self.pedestrian_sign_start_time = None
+        self.PEDESTRIAN_SIGN_DURATION = 2.0
         
         self.current_state = "lane_following"
         self.state_start_time = time.time()
@@ -76,7 +83,8 @@ class EnhancedLanePlanner:
                 x1, y1, x2, y2 = map(int, xyxy)
                 area = (x2 - x1) * (y2 - y1)
                 
-                if area >= self.min_detection_area:
+                # 신호등 불(9,10,11)만 min_area 체크 제외
+                if cls_id in [9, 10, 11] or area >= self.min_detection_areas.get(cls_id, 3000):
                     detected_objects.append({
                         'class': cls_id,
                         'confidence': conf,
@@ -86,102 +94,91 @@ class EnhancedLanePlanner:
         
         return detected_objects
 
-    def process_traffic_light(self, detected_objects, boxes):
+    def process_traffic_light(self, detected_objects):
         class_ids = [obj["class"] for obj in detected_objects]
         
-        if 8 in class_ids:
-            has_red = has_yellow = has_green = False
-            
-            if boxes is not None:
-                for i in range(len(boxes)):
-                    cls_id = int(boxes[i].cls[0].item())
-                    if cls_id == 11:
-                        has_red = True
-                    elif cls_id == 10:
-                        has_yellow = True
-                    elif cls_id == 9:
-                        has_green = True
-            
-            if has_red:
-                print("🔴 빨간불 감지 - 정지")
-                return "red_light", (0.0, 0.0)
-            elif has_yellow:
-                print("🟡 노란불 감지 - 감속")
-                return "yellow_light", (self.MIN_SPEED, None)
+        if 8 in class_ids:  # 신호등이 감지된 경우
+            has_red = has_yellow = has_green = has_none = False
+            if 11 in class_ids:
+                has_red = True
+            elif 10 in class_ids:
+                has_yellow = True
+            elif 9 in class_ids:
+                has_green = True
+            else:
+                has_none = True
+
+            if has_red or has_yellow:
+                print("🚨 빨간불 또는 노란불 감지 - 정지")
+                return "stop", (0.0, 0.0)
             elif has_green:
                 print("🟢 초록불 감지 - 통과")
-                return "green_light", None
+                return "go", (self.STRAIGHT_SPEED, 0.0)
             else:
-                print("⚠️ 신호등 감지, 불빛 미확인")
-                return "traffic_light_unknown", (self.MIN_SPEED, None)
+                print("🚦 신호등 감지 없음 - 직진")
+                return "no_signal", (self.STRAIGHT_SPEED, 0.0)
         
         return None, None
-
     def process_traffic_signs(self, detected_objects):
         class_ids = [obj["class"] for obj in detected_objects]
-        current_time = time.time()
         
-        # 이전에 감지된 표지판이 있고 쿨다운 시간이 지나지 않았다면 무시
+        # 프레임 카운터 증가
+        self.current_frame_count += 1
+        
+        # 정지 표지판 처리
+        if 4 in class_ids and not self.stop_sign_detected:
+            # 마지막 정지 표지판 감지 후 5초가 지났는지 확인
+            if self.current_frame_count - self.stop_sign_last_detected_frame >= self.stop_sign_cooldown_frames:
+                print("✅ 정지 표지판 감지 - 완전정지")
+                self.stop_sign_detected = True
+                self.stop_sign_start_frame = self.current_frame_count
+                self.stop_sign_last_detected_frame = self.current_frame_count
+                return "stop_sign", (0.0, 0.0)
+        
+        # 정지 표지판 감지 후 2초 동안 정지
+        if self.stop_sign_detected:
+            if self.current_frame_count - self.stop_sign_start_frame < self.STOP_SIGN_DURATION_FRAMES:
+                return "stop_sign", (0.0, 0.0)
+            else:
+                self.stop_sign_detected = False
+                self.stop_sign_start_frame = 0
+        
+        # 이전에 감지된 표지판이 있고 쿨다운 프레임이 지나지 않았다면 이전 동작 유지
         if (self.last_seen_sign is not None and 
-            current_time - self.last_action_time < self.SIGN_COOLDOWN_SEC):
-            return None, None
+            self.current_frame_count - self.last_action_time < self.SIGN_COOLDOWN_FRAMES):
+            if self.last_seen_sign == 0:
+                return "straight_sign", None
+            elif self.last_seen_sign == 1:
+                return "left_turn_sign", (self.MIN_SPEED, -self.MAX_STEER * 0.8)
+            elif self.last_seen_sign == 2:
+                return "right_turn_sign", (self.MIN_SPEED, self.MAX_STEER * 0.8)
+            elif self.last_seen_sign == 3:
+                return "pedestrian_sign", (self.MAX_SPEED * 0.4, None)
         
+        # 새로운 표지판 감지
         if 0 in class_ids:
             print("✅ 직진 표지판 감지")
             self.last_seen_sign = 0
-            self.last_action_time = current_time
+            self.last_action_time = self.current_frame_count
             return "straight_sign", None
             
         elif 1 in class_ids:
             print("✅ 좌회전 표지판 감지")
             self.last_seen_sign = 1
-            self.last_action_time = current_time
-            return "left_turn_sign", (self.MIN_SPEED, -self.MAX_STEER * 0.8)
+            self.last_action_time = self.current_frame_count
+            return "left_turn_sign", (self.MIN_SPEED, self.MAX_STEER * 0.8)
             
         elif 2 in class_ids:
             print("✅ 우회전 표지판 감지")
             self.last_seen_sign = 2
-            self.last_action_time = current_time
-            return "right_turn_sign", (self.MIN_SPEED, self.MAX_STEER * 0.8)
+            self.last_action_time = self.current_frame_count
+            return "right_turn_sign", (self.MIN_SPEED, -self.MAX_STEER * 0.8)
             
         elif 3 in class_ids:
-            # 보행자 표지판 처리
-            # 1. 보행자 표지판이 감지되면 최소 속도의 50%로 감속
-            # 2. 조향은 현재 차선을 따라가도록 유지 (None 반환)
             print("✅ 보행자 표지판 감지 - 서행")
             self.last_seen_sign = 3
-            self.last_action_time = current_time
+            self.last_action_time = self.current_frame_count
             return "pedestrian_sign", (self.MAX_SPEED * 0.4, None)
-            
-        elif 4 in class_ids:
-            # 정지 표지판 처리 로직
-            if not self.stop_sign_detected:
-                # 1. 처음 정지 표지판을 감지한 경우
-                # - 정지 상태로 전환
-                # - 속도와 조향을 0으로 설정하여 완전 정지
-                print("✅ 정지 표지판 감지 - 완전정지")
-                self.stop_sign_detected = True
-                self.stop_start_time = current_time
-                self.current_state = "stopping"
-                return "stop_sign", (0.0, 0.0)
-            elif current_time - self.stop_start_time < self.STOP_DURATION:
-                # 2. 정지 중인 경우 (STOP_DURATION = 2초 동안 정지)
-                # - 계속해서 정지 상태 유지
-                return "stop_sign", (0.0, 0.0)
-            else:
-                # 3. 정지 시간이 지난 후 처리
-                if self.last_stop_sign_time is None or current_time - self.last_stop_sign_time > self.COOLDOWN_DURATION:
-                    # 마지막 정지 표지판 감지 후 COOLDOWN_DURATION(5초) 이상 지났으면
-                    # 정지 상태를 해제하고 차선 추종 모드로 복귀
-                    print("✅ 정지 완료 - 출발")
-                    self.stop_sign_detected = False
-                    self.stop_start_time = None
-                    self.current_state = "lane_following"
-                    self.last_stop_sign_time = current_time
-                    return None, None
-                else:
-                    # 쿨다운 기간 중에는 추가 동작 없음
-                    return None, None
         
         return None, None
 
@@ -227,7 +224,7 @@ class EnhancedLanePlanner:
         detected_objects = self.detect_objects(frame)
         
         # 신호등 처리
-        traffic_result, traffic_control = self.process_traffic_light(detected_objects, None)
+        traffic_result, traffic_control = self.process_traffic_light(detected_objects)
         if traffic_result:
             if traffic_control:
                 speed, steering = traffic_control

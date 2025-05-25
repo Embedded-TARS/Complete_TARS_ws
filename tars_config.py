@@ -16,6 +16,23 @@ MIDDLE_LANE_WIDTH_PX = 478  # Calibrated middle lane width
 POLY_DEG = 3  # 차선 곡선 피팅에 사용할 다항식 차수
 EMA_ALPHA = 0.9  # 차선 중앙 위치 스무딩 계수
 
+# 객체 감지 설정
+MIN_DETECTION_AREAS = {
+    0: 3000,  # straight sign
+    1: 3000,  # left sign
+    2: 3000,  # right sign
+    3: 3000,  # pedestrian sign
+    4: 3000,  # stop sign
+    5: 5000,  # car
+    6: 5000,  # bus
+    7: 5000,  # motorcycle
+    8: 1000,  # traffic light
+    9: 10,  # green light
+    10: 10, # yellow light
+    11: 10, # red light
+    12: 3000  # lane
+}
+
 # 자율주행 제어 설정
 MAX_STEER = 0.3     # 최대 조향 각속도 (rad/s)
 MAX_SPEED = 0.5

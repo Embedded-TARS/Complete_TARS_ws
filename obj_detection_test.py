@@ -4,6 +4,7 @@ import time
 import cv2
 import numpy as np
 from jetcam.csi_camera import CSICamera
+from tars_config import CAMERA_WIDTH, CAMERA_HEIGHT, CAMERA_FPS
 
 # 클래스 정보 매핑
 CLASS_INFO = {
@@ -48,8 +49,8 @@ def detect_objects(frame, sign_model, min_area=1000):
             x1, y1, x2, y2 = map(int, xyxy)
             area = (x2 - x1) * (y2 - y1)
             
-            # 최소 면적 이상인 객체만 저장
-            if area >= min_area:
+            # 신호등 불(9,10,11)만 min_area 체크 제외
+            if cls_id in [9, 10, 11] or area >= min_area:
                 detected_objects.append({
                     "bbox": [x1, y1, x2, y2],
                     "class": cls_id,
@@ -78,6 +79,10 @@ def draw_detections(frame, detected_objects):
         
         # 바운딩 박스 그리기
         cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), color, 2)
+        
+        # 신호등 관련 객체는 더 두껍게 표시
+        if cls_id in [8, 9, 10, 11]:  # 신호등과 불
+            cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), color, 3)
         
         # 라벨 텍스트 준비
         label = f"{class_name}: {conf:.2f}"
@@ -110,25 +115,45 @@ def process_traffic_light(detected_objects, boxes):
     class_ids = [obj["class"] for obj in detected_objects]
     
     if 8 in class_ids:  # 신호등 감지
-        has_red = has_yellow = has_green = False
+        print("\n=== 신호등 감지 디버깅 ===")
+        print(f"전체 감지된 객체 수: {len(boxes)}")
         
+        has_red = has_yellow = has_green = False
+        red_conf = yellow_conf = green_conf = 0.0
+        
+        # 모든 감지된 객체 정보 출력
+        print("\n감지된 모든 객체:")
         for i in range(len(boxes)):
             cls_id = int(boxes[i].cls[0].item())
+            conf = float(boxes[i].conf[0].item())
+            xyxy = boxes[i].xyxy[0].cpu().numpy()
+            print(f"객체 {i}: 클래스={cls_id}, 신뢰도={conf:.2f}, 위치={xyxy}")
+            
             if cls_id == 11:    # 빨간불
                 has_red = True
+                red_conf = conf
+                print(f"🔴 빨간불 감지 - 신뢰도: {conf:.2f}")
             elif cls_id == 10:  # 노란불
                 has_yellow = True
+                yellow_conf = conf
+                print(f"🟡 노란불 감지 - 신뢰도: {conf:.2f}")
             elif cls_id == 9:   # 초록불
                 has_green = True
+                green_conf = conf
+                print(f"🟢 초록불 감지 - 신뢰도: {conf:.2f}")
+        
+        # 신호등 상태 요약
+        print("\n=== 신호등 상태 요약 ===")
+        print(f"빨간불: {'감지됨' if has_red else '미감지'} (신뢰도: {red_conf:.2f})")
+        print(f"노란불: {'감지됨' if has_yellow else '미감지'} (신뢰도: {yellow_conf:.2f})")
+        print(f"초록불: {'감지됨' if has_green else '미감지'} (신뢰도: {green_conf:.2f})")
+        print("========================\n")
         
         if has_red:
-            print("🔴 빨간불 감지")
             return "red", (0.0, 0.0)  # 정지
         elif has_yellow:
-            print("🟡 노란불 감지")
             return "yellow", None  # 기본 주행 계속
         elif has_green:
-            print("🟢 초록불 감지")
             return "green", None   # 기본 주행 계속
         else:
             print("⚠️ 신호등은 있지만 불빛 없음")
@@ -254,9 +279,9 @@ def main():
     # 카메라 초기화
     print("Initializing camera...")
     try:
-        camera = CSICamera(width=640, height=480, capture_fps=30)
+        camera = CSICamera(width=CAMERA_WIDTH, height=CAMERA_HEIGHT, capture_fps=CAMERA_FPS)
         camera.running = True
-        print(f"Camera initialized with settings: 640x480 @ 30fps")
+        print(f"Camera initialized with settings: {CAMERA_WIDTH}x{CAMERA_HEIGHT} @ {CAMERA_FPS}fps")
     except Exception as e:
         print(f"Error initializing camera: {e}")
         return
@@ -314,8 +339,8 @@ def main():
                 else:
                     print("검출된 객체 없음")
             
-            # 화면에 표시 (주석 해제하면 화면에 표시됨)
-            # cv2.imshow('Object Detection with Annotations', final_frame)
+            # 화면에 표시
+            cv2.imshow('Object Detection with Annotations', final_frame)
             
             # 'q' 키를 누르면 종료
             if cv2.waitKey(1) & 0xFF == ord('q'):
