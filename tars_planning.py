@@ -8,6 +8,7 @@ from tars_config import (
     MAX_STEER, MAX_SPEED, MIN_SPEED, STRAIGHT_SPEED, TURN_THRESHOLD,
     WHEELBASE, LOOKAHEAD_DISTANCE, MIN_DETECTION_AREAS
 )
+import cv2
 
 # 클래스 정보 매핑
 CLASS_INFO = {
@@ -83,8 +84,18 @@ class EnhancedLanePlanner:
                 x1, y1, x2, y2 = map(int, xyxy)
                 area = (x2 - x1) * (y2 - y1)
                 
+                # 차량 클래스인 경우 위치 정보 추가
+                if cls_id in self.vehicle_classes:
+                    vehicle_center_x = (x1 + x2) / 2
+                    detected_objects.append({
+                        'class': cls_id,
+                        'confidence': conf,
+                        'area': area,
+                        'bbox': (x1, y1, x2, y2),
+                        'position': 'left' if vehicle_center_x < frame.shape[1] / 2 else 'right'
+                    })
                 # 신호등 불(9,10,11)만 min_area 체크 제외
-                if cls_id in [9, 10, 11] or area >= self.min_detection_areas.get(cls_id, 3000):
+                elif cls_id in [9, 10, 11] or area >= self.min_detection_areas.get(cls_id, 3000):
                     detected_objects.append({
                         'class': cls_id,
                         'confidence': conf,
@@ -182,10 +193,23 @@ class EnhancedLanePlanner:
         
         return None, None
 
-    def calculate_lane_following(self, lane_center_x, image_center_x):
+    def calculate_lane_following(self, lane_center_x, image_center_x, detected_objects=None):
         """Pure Pursuit 기반 차선 추종 로직"""
         if lane_center_x is None:
             return 0.0, 0.0, 0.0
+        
+        # 물체 위치에 따른 차선 중심점 조정
+        if detected_objects:
+            for obj in detected_objects:
+                if obj['class'] in self.vehicle_classes and 'position' in obj:
+                    x1, y1, x2, y2 = obj['bbox']
+                    object_width = x2 - x1
+                    if obj['position'] == 'right':
+                        # 오른쪽에 물체가 있으면 차선 중심점을 왼쪽으로 조정
+                        lane_center_x = lane_center_x - object_width
+                    elif obj['position'] == 'left':
+                        # 왼쪽에 물체가 있으면 차선 중심점을 오른쪽으로 조정
+                        lane_center_x = lane_center_x + object_width
         
         # 편차 계산 (정규화)
         deviation = (lane_center_x - image_center_x) / image_center_x
@@ -229,7 +253,7 @@ class EnhancedLanePlanner:
             if traffic_control:
                 speed, steering = traffic_control
                 if steering is None:
-                    _, lane_steering, deviation = self.calculate_lane_following(lane_center_x, image_center_x)
+                    _, lane_steering, deviation = self.calculate_lane_following(lane_center_x, image_center_x, detected_objects)
                     steering = lane_steering
                 return speed, steering, 0.0, traffic_result, detected_objects
         
@@ -239,14 +263,14 @@ class EnhancedLanePlanner:
             if sign_control:
                 speed, steering = sign_control
                 if steering is None:
-                    _, lane_steering, deviation = self.calculate_lane_following(lane_center_x, image_center_x)
+                    _, lane_steering, deviation = self.calculate_lane_following(lane_center_x, image_center_x, detected_objects)
                     steering = lane_steering
                 else:
                     deviation = 0.0
                 return speed, steering, deviation, sign_result, detected_objects
         
         # 기본 차선 추종
-        speed, steering, deviation = self.calculate_lane_following(lane_center_x, image_center_x)
+        speed, steering, deviation = self.calculate_lane_following(lane_center_x, image_center_x, detected_objects)
         return speed, steering, deviation, "lane_following", detected_objects
 
     def plan(self, lane_center_x, image_center_x, frame=None):
@@ -264,3 +288,23 @@ class EnhancedLanePlanner:
             "last_action_time": self.last_action_time,
             "current_state": self.current_state
         }
+
+    def visualize_detections(self, frame, detected_objects):
+        # 감지된 객체를 시각화하여 반환
+        vis_frame = frame.copy()
+        
+        for obj in detected_objects:
+            x1, y1, x2, y2 = obj['bbox']
+            cls_id = obj['class']
+            color = CLASS_INFO[cls_id]['color']
+            cv2.rectangle(vis_frame, (x1, y1), (x2, y2), color, 2)
+            
+            # 차량 클래스인 경우에만 위치 정보 표시
+            if cls_id in self.vehicle_classes and 'position' in obj:
+                label = f"{CLASS_INFO[cls_id]['name']} ({obj['position']})"
+            else:
+                label = CLASS_INFO[cls_id]['name']
+                
+            cv2.putText(vis_frame, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+        
+        return vis_frame

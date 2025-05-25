@@ -153,12 +153,15 @@ def main(display_mode=True):
                 # 차선 인식 시각화를 위해 perception 모듈에 위임
                 frame_with_lanes = perception.visualize_lanes(frame, deviation, steering, roi)
                 
+                # 객체 인식 시각화 추가
+                frame_with_objects = planner.visualize_detections(frame_with_lanes, detected_objects)
+                
                 # 일시정지 상태 표시
                 if is_paused:
-                    cv2.putText(frame_with_lanes, "PAUSED", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+                    cv2.putText(frame_with_objects, "PAUSED", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
                 
                 # 결과 이미지 출력
-                cv2.imshow("YOLO-AutoDrive", frame_with_lanes)
+                cv2.imshow("YOLO-AutoDrive", frame_with_objects)
 
             # 키 입력 처리 - 논블로킹 방식
             if is_key_pressed():
