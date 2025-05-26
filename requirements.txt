@@ -1,10 +1,42 @@
+# TARS 자율주행 로봇 시스템 요구사항
+# Python 패키지 의존성 목록
+
+# 기본 패키지들
 pyserial
 opencv-python
 pyttsx3
 pynput
 ipywidgets==8.1.2
 ipycanvas==0.13.2
+
+# AI/ML 패키지들
 ultralytics==8.3.132
 onnx>=1.12.0
 onnxslim>=0.1.46
 onnxruntime-gpu
+
+# 새로 추가된 패키지들 (설치 과정에서 필요했던 것들)
+# jetcam은 별도 설치 필요: pip install git+https://github.com/NVIDIA-AI-IOT/jetcam.git
+
+# PyTorch 관련 (ultralytics 의존성)
+torch>=2.0.0
+torchvision>=0.15.0
+torchaudio>=2.0.0
+
+# 수치 연산 (호환성 고려)
+numpy>=1.22,<2.1  # numba 호환성을 위해 버전 제한
+
+# 기타 유용한 패키지들
+pillow  # 이미지 처리
+matplotlib  # 시각화
+scipy  # 과학 연산
+pandas  # 데이터 처리
+pygame  # 게임패드/키보드 입력 처리
+
+# 개발 도구 (선택사항)
+# jupyter  # Jupyter 노트북
+# ipython  # 향상된 Python 셸
+
+# 시스템 도구
+pathlib2  # 경로 처리 (Python < 3.4 호환성)
+termcolor  # 터미널 색상 출력
