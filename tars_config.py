@@ -34,7 +34,7 @@ MIN_DETECTION_AREAS = {
 }
 
 # 자율주행 제어 설정
-MAX_STEER = 0.3     # 최대 조향 각속도 (rad/s)
+MAX_STEER = 0.4     # 최대 조향 각속도 (rad/s)
 MAX_SPEED = 0.5
 MIN_SPEED = 0.5
 STRAIGHT_SPEED = 0.3
