@@ -23,8 +23,8 @@ MIN_DETECTION_AREAS = {
     2: 3000,  # right sign
     3: 3000,  # pedestrian sign
     4: 3000,  # stop sign
-    5: 15000,  # car
-    6: 20000,  # bus
+    5: 10000,  # car
+    6: 15000,  # bus
     7: 5000,  # motorcycle
     8: 1000,  # traffic light
     9: 10,  # green light
@@ -34,7 +34,7 @@ MIN_DETECTION_AREAS = {
 }
 
 # 자율주행 제어 설정
-MAX_STEER = 0.3     # 최대 조향 각속도 (rad/s)
+MAX_STEER = 0.8      # 최대 조향 각속도 (rad/s)
 MAX_SPEED = 0.5
 MIN_SPEED = 0.5
 STRAIGHT_SPEED = 0.3

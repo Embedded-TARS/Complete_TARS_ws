@@ -142,6 +142,12 @@ def main(display_mode=True):
             
             print_status_clean(status)
 
+            # 회피 로직 상태 디버깅 메시지 추가
+            if "avoidance" in state:
+                print(f"🚧 [DEBUG] 현재 회피 로직 상태: {state}")
+
+            print_status_clean(status)
+
             # Control: 로봇에 제어 명령 전송 (일시정지 상태가 아닐 때만)
             if not is_paused:
                 controller.send_control(linear_speed, steering)
