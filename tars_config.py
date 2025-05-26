@@ -42,7 +42,7 @@ TURN_THRESHOLD = 0.12
 
 # Pure Pursuit 설정
 WHEELBASE = 0.1  # 차량 축간 거리 (100mm)
-LOOKAHEAD_DISTANCE = 0.2  # Pure Pursuit 전방 주시 거리
+LOOKAHEAD_DISTANCE = 0.15  # Pure Pursuit 전방 주시 거리
 
 # 수동 제어 설정
 STEP_STEER = 0.03  # 조향 단계 값

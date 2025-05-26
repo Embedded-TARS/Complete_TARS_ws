@@ -53,6 +53,15 @@ class EnhancedLanePlanner:
         self.PEDESTRIAN_COOLDOWN_FRAMES = 60
         self.current_frame_count = 0
         
+        # 회전 관련 상태 변수 추가
+        self.is_turning = False
+        self.turn_start_frame = 0
+        self.turn_direction = None
+        self.LEFT_TURN_DURATION_FRAMES = 15  # 좌회전에 필요한 프레임 수
+        self.RIGHT_TURN_DURATION_FRAMES = 10  # 우회전에 필요한 프레임 수
+        self.STRAIGHT_AFTER_TURN_FRAMES = 20  # 회전 후 직진 시간
+        self.turn_phase = "none"  # none, turning, straight, stop
+        
         # 정지 표지판 관련 플래그
         self.stop_sign_detected = False
         self.stop_sign_start_frame = 0
@@ -80,7 +89,7 @@ class EnhancedLanePlanner:
         self.avoidance_active = False
         self.avoidance_direction = None
         self.avoidance_start_frame = 0
-        self.AVOIDANCE_DURATION_FRAMES = 90
+        self.AVOIDANCE_DURATION_FRAMES = 105
         self.AVOIDANCE_COOLDOWN_FRAMES = 90
         self.last_avoidance_frame = -1000
         
@@ -93,11 +102,33 @@ class EnhancedLanePlanner:
         detected_objects = []
         
         if boxes is not None:
+            # 차량용 ROI 설정 - 이미지 하단 60%만 사용
+            vehicle_roi_height = int(frame.shape[0] * 0.6)
+            vehicle_roi_y = frame.shape[0] - vehicle_roi_height
+            
+            # 표지판용 ROI 설정 - 이미지 하단 80% 사용
+            sign_roi_height = int(frame.shape[0] * 0.9)
+            sign_roi_y = frame.shape[0] - sign_roi_height
+            
             for i in range(len(boxes)):
                 xyxy = boxes[i].xyxy[0].cpu().numpy()
                 cls_id = int(boxes[i].cls[0].item())
                 conf = float(boxes[i].conf[0].item())
                 x1, y1, x2, y2 = map(int, xyxy)
+                
+                # 객체의 중심점 계산
+                obj_center_y = (y1 + y2) / 2
+                
+                # 차량 클래스인 경우 차량용 ROI 체크
+                if cls_id in self.vehicle_classes:
+                    if obj_center_y < vehicle_roi_y:
+                        continue  # 차량 ROI 밖의 객체는 무시
+                
+                # 표지판 클래스(0,1,2,3,4)인 경우 표지판용 ROI 체크
+                elif cls_id in [0, 1, 2, 3, 4]:
+                    if obj_center_y < sign_roi_y:
+                        continue  # 표지판 ROI 밖의 객체는 무시
+                
                 area = (x2 - x1) * (y2 - y1)
                 
                 # 차량 클래스인 경우 위치 정보 추가
@@ -147,11 +178,41 @@ class EnhancedLanePlanner:
         
         return None, None
 
-    def process_traffic_signs(self, detected_objects):
+    def process_traffic_signs(self, detected_objects, lane_center_x=None, image_center_x=None):
         class_ids = [obj["class"] for obj in detected_objects]
         
         # 프레임 카운터 증가
         self.current_frame_count += 1
+        
+        # 회전 동작 중인 경우
+        if self.is_turning:
+            elapsed = self.current_frame_count - self.turn_start_frame
+            
+            if self.turn_phase == "turning":
+                # 좌/우회전에 따라 다른 회전 시간 적용
+                turn_duration = self.LEFT_TURN_DURATION_FRAMES if self.turn_direction == "left" else self.RIGHT_TURN_DURATION_FRAMES
+                if elapsed < turn_duration:
+                    # 90도 회전 수행
+                    steering = -self.MAX_STEER * 0.8 if self.turn_direction == "left" else self.MAX_STEER * 0.8
+                    return "turning", (self.MIN_SPEED, steering)
+                else:
+                    # 회전 완료, 직진 단계로 전환
+                    self.turn_phase = "straight"
+                    self.turn_start_frame = self.current_frame_count
+                    return "straight_after_turn", (self.STRAIGHT_SPEED, 0.0)
+            
+            elif self.turn_phase == "straight":
+                if elapsed < self.STRAIGHT_AFTER_TURN_FRAMES:
+                    # 직진 유지
+                    return "straight_after_turn", (self.STRAIGHT_SPEED, 0.0)
+                else:
+                    # 정지 단계로 전환
+                    self.turn_phase = "stop"
+                    return "stop_after_turn", (0.0, 0.0)
+            
+            elif self.turn_phase == "stop":
+                # 정지 상태 유지
+                return "stop_after_turn", (0.0, 0.0)
         
         # 정지 표지판 처리
         if 4 in class_ids and not self.stop_sign_detected:
@@ -174,6 +235,10 @@ class EnhancedLanePlanner:
         # 이전에 감지된 표지판이 있고 쿨다운 프레임이 지나지 않았다면 이전 동작 유지
         if (self.last_seen_sign == 3 and 
             self.current_frame_count - self.last_action_time < self.PEDESTRIAN_COOLDOWN_FRAMES):
+            if lane_center_x is not None and image_center_x is not None:
+                _, lane_steering, _ = self.calculate_lane_following(lane_center_x, image_center_x, [])
+                if abs(lane_steering) > self.TURN_THRESHOLD:
+                    return "pedestrian_sign", (self.MAX_SPEED * 0.99, lane_steering)
             return "pedestrian_sign", (self.MAX_SPEED * 0.4, None)
         elif (self.last_seen_sign is not None and self.current_frame_count - self.last_action_time < self.SIGN_COOLDOWN_FRAMES):
             if self.last_seen_sign == 0:
@@ -194,21 +259,35 @@ class EnhancedLanePlanner:
             print("✅ 좌회전 표지판 감지")
             self.last_seen_sign = 1
             self.last_action_time = self.current_frame_count
-            return "left_turn_sign", (self.MIN_SPEED, self.MAX_STEER * 0.8)
+            # 회전 상태 초기화
+            self.is_turning = True
+            self.turn_start_frame = self.current_frame_count
+            self.turn_direction = "left"
+            self.turn_phase = "turning"
+            return "left_turn_sign", (self.MIN_SPEED, -self.MAX_STEER * 0.8)
             
         elif 2 in class_ids:
             print("✅ 우회전 표지판 감지")
             self.last_seen_sign = 2
             self.last_action_time = self.current_frame_count
-            return "right_turn_sign", (self.MIN_SPEED, -self.MAX_STEER * 0.8)
+            # 회전 상태 초기화
+            self.is_turning = True
+            self.turn_start_frame = self.current_frame_count
+            self.turn_direction = "right"
+            self.turn_phase = "turning"
+            return "right_turn_sign", (self.MIN_SPEED, self.MAX_STEER * 0.8)
 
         elif 3 in class_ids:
             print("✅ 보행자 표지판 감지 - 서행")
             self.last_seen_sign = 3
             self.last_action_time = self.current_frame_count
+            if lane_center_x is not None and image_center_x is not None:
+                # 차선 추종을 위한 조향각 계산
+                _, lane_steering, _ = self.calculate_lane_following(lane_center_x, image_center_x, [])
+                # 조향각이 클 때는 더 많은 파워 제공
+                if abs(lane_steering) > self.TURN_THRESHOLD:
+                    return "pedestrian_sign", (self.MAX_SPEED * 0.99, lane_steering)
             return "pedestrian_sign", (self.MAX_SPEED * 0.4, None)
-            # 기존 calculate_lane_following 메서드 활용
-
         
         return None, None
 
@@ -217,24 +296,28 @@ class EnhancedLanePlanner:
         Pure Pursuit 기반 차선 추종 로직 및 회피 주행 로직
         """
         self.current_frame_count += 1
+        AVOIDANCE_PHASE_1_DURATION = self.AVOIDANCE_DURATION_FRAMES * 0.15  # 15% 시간
+        AVOIDANCE_PHASE_2_DURATION = self.AVOIDANCE_DURATION_FRAMES * 0.15  # 15% 시간
+        AVOIDANCE_PHASE_3_DURATION = self.AVOIDANCE_DURATION_FRAMES * 0.2  # 20% 시간
+        AVOIDANCE_PHASE_4_DURATION = self.AVOIDANCE_DURATION_FRAMES * 0.5  # 50% 시간
 
         # 회피 동작 중이라면 회피 로직 수행
         if self.avoidance_active:
             elapsed = self.current_frame_count - self.avoidance_start_frame
 
-            if elapsed < self.AVOIDANCE_DURATION_FRAMES // 5:
+            if elapsed < AVOIDANCE_PHASE_1_DURATION:
                 # 첫 번째 단계: 장애물 반대 방향으로 크게 조향
-                steering = -self.MAX_STEER * 0.8 if self.avoidance_direction == 'left' else self.MAX_STEER * 0.8
+                steering = -self.MAX_STEER * 0.6 if self.avoidance_direction == 'left' else self.MAX_STEER * 0.6
                 speed = self.MIN_SPEED
-            elif elapsed < self.AVOIDANCE_DURATION_FRAMES * 2 // 5:
+            elif elapsed < AVOIDANCE_PHASE_1_DURATION + AVOIDANCE_PHASE_2_DURATION:
                 # 두 번째 단계: 적당히 원래 방향으로 복귀
                 steering = self.MAX_STEER * 0.8 if self.avoidance_direction == 'left' else -self.MAX_STEER * 0.8
                 speed = self.MIN_SPEED
-            elif elapsed < self.AVOIDANCE_DURATION_FRAMES * 4 // 5:
+            elif elapsed < AVOIDANCE_PHASE_1_DURATION + AVOIDANCE_PHASE_2_DURATION + AVOIDANCE_PHASE_3_DURATION:
                 # 세 번째 단계: 직진
                 steering = 0.0
                 speed = 0.3
-            elif elapsed < self.AVOIDANCE_DURATION_FRAMES:
+            elif elapsed < AVOIDANCE_PHASE_1_DURATION + AVOIDANCE_PHASE_2_DURATION + AVOIDANCE_PHASE_3_DURATION + AVOIDANCE_PHASE_4_DURATION:
                 # 네 번째 단계: 장애물 방향으로 조향
                 steering = self.MAX_STEER * 0.8 if self.avoidance_direction == 'left' else -self.MAX_STEER * 0.8
                 speed = self.MIN_SPEED
@@ -257,19 +340,6 @@ class EnhancedLanePlanner:
         if detected_objects:
             print(f"🔍 감지된 객체 수: {len(detected_objects)}")
             for obj in detected_objects:
-# <<<<<<< HEAD
-#                 if obj['class'] in self.vehicle_classes and 'position' in obj:
-#                     x1, y1, x2, y2 = obj['bbox']
-#                     object_width = min((y2 - y1) / 2, 30)
-#                     if obj['position'] == 'right':
-#                         # 오른쪽에 물체가 있으면 차선 중심점을 왼쪽으로 조정
-#                         lane_center_x = lane_center_x - object_width
-#                     elif obj['position'] == 'left':
-#                         # 왼쪽에 물체가 있으면 차선 중심점을 오른쪽으로 조정
-#                         lane_center_x = lane_center_x + object_width
-#
-#         # 편차 계산 (정규화)
-# =======
                 print(f"   - 객체 클래스: {obj['class']}, 면적: {obj['area']}, 위치: {obj.get('position', 'N/A')}")
                 if obj['class'] in self.vehicle_classes:
                     area = obj['area']
@@ -297,7 +367,6 @@ class EnhancedLanePlanner:
                         return self.MIN_SPEED, 0.0, 0.0
 
         # 정상 차선 추종 계산
-# >>>>>>> jh
         deviation = (lane_center_x - image_center_x) / image_center_x
         deviation = np.clip(deviation, -1.0, 1.0)
 
@@ -330,7 +399,7 @@ class EnhancedLanePlanner:
                 return speed, steering, 0.0, traffic_result, detected_objects
         
         # 교통표지판 처리
-        sign_result, sign_control = self.process_traffic_signs(detected_objects)
+        sign_result, sign_control = self.process_traffic_signs(detected_objects, lane_center_x, image_center_x)
         if sign_result:
             if sign_control:
                 speed, steering = sign_control
