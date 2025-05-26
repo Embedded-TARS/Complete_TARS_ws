@@ -161,7 +161,7 @@ def main(display_mode=True):
                     cv2.putText(frame_with_objects, "PAUSED", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
                 
                 # 결과 이미지 출력
-                cv2.imshow("YOLO-AutoDrive", frame_with_objects)
+                # cv2.imshow("YOLO-AutoDrive", frame_with_objects)
 
             # 키 입력 처리 - 논블로킹 방식
             if is_key_pressed():
@@ -278,7 +278,7 @@ def run_camera_test():
             while True:
                 frame = camera_manager.get_frame()
                 if frame is not None:
-                    cv2.imshow("Camera Test", frame)
+                    # cv2.imshow("Camera Test", frame)
                     if cv2.waitKey(1) & 0xFF == ord('q'):
                         break
                 else:
