@@ -4,7 +4,7 @@ import time
 import cv2
 import numpy as np
 from jetcam.csi_camera import CSICamera
-from tars_config import CAMERA_WIDTH, CAMERA_HEIGHT, CAMERA_FPS
+from tars_config import CAMERA_WIDTH, CAMERA_HEIGHT, CAMERA_FPS, MIN_DETECTION_AREAS
 
 # 클래스 정보 매핑
 CLASS_INFO = {
@@ -50,7 +50,7 @@ def detect_objects(frame, sign_model, min_area=1000):
             area = (x2 - x1) * (y2 - y1)
             
             # 신호등 불(9,10,11)만 min_area 체크 제외
-            if cls_id in [9, 10, 11] or area >= min_area:
+            if cls_id in [9, 10, 11] or area >= MIN_DETECTION_AREAS.get(cls_id, 3000):
                 detected_objects.append({
                     "bbox": [x1, y1, x2, y2],
                     "class": cls_id,
@@ -84,8 +84,12 @@ def draw_detections(frame, detected_objects):
         if cls_id in [8, 9, 10, 11]:  # 신호등과 불
             cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), color, 3)
         
+        # 픽셀 크기 계산
+        width = x2 - x1
+        height = y2 - y1
+        
         # 라벨 텍스트 준비
-        label = f"{class_name}: {conf:.2f}"
+        label = f"{class_name}: {conf:.2f} ({width}x{height})"
         
         # 텍스트 크기 계산
         font = cv2.FONT_HERSHEY_SIMPLEX
@@ -335,12 +339,15 @@ def main():
                         class_name = CLASS_INFO.get(cls_id, {}).get("name", f"Unknown_{cls_id}")
                         conf = obj["confidence"]
                         area = obj["area"]
-                        print(f"  {class_name}: 신뢰도 {conf:.2f}, 영역 {area}")
+                        x1, y1, x2, y2 = obj["bbox"]
+                        width = x2 - x1
+                        height = y2 - y1
+                        print(f"  {class_name}: 신뢰도 {conf:.2f}, 영역 {area}, 크기 {width}x{height}")
                 else:
                     print("검출된 객체 없음")
             
             # 화면에 표시
-            cv2.imshow('Object Detection with Annotations', final_frame)
+            # cv2.imshow('Object Detection with Annotations', final_frame)
             
             # 'q' 키를 누르면 종료
             if cv2.waitKey(1) & 0xFF == ord('q'):
