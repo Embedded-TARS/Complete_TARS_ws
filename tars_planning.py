@@ -203,7 +203,7 @@ class EnhancedLanePlanner:
             for obj in detected_objects:
                 if obj['class'] in self.vehicle_classes and 'position' in obj:
                     x1, y1, x2, y2 = obj['bbox']
-                    object_width = x2 - x1
+                    object_width = min((y2 - y1) / 2, 30)
                     if obj['position'] == 'right':
                         # 오른쪽에 물체가 있으면 차선 중심점을 왼쪽으로 조정
                         lane_center_x = lane_center_x - object_width
