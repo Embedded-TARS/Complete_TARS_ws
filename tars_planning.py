@@ -57,7 +57,7 @@ class EnhancedLanePlanner:
         self.is_turning = False
         self.turn_start_frame = 0
         self.turn_direction = None
-        self.LEFT_TURN_DURATION_FRAMES = 15  # 좌회전에 필요한 프레임 수
+        self.LEFT_TURN_DURATION_FRAMES = 10  # 좌회전에 필요한 프레임 수
         self.RIGHT_TURN_DURATION_FRAMES = 10  # 우회전에 필요한 프레임 수
         self.STRAIGHT_AFTER_TURN_FRAMES = 20  # 회전 후 직진 시간
         self.turn_phase = "none"  # none, turning, straight, stop
@@ -297,18 +297,23 @@ class EnhancedLanePlanner:
         """
         self.current_frame_count += 1
 
-        # 왼쪽 회피 시 회피 지속 시간을 2배로 설정
-        if self.avoidance_direction == 'left':
-            self.AVOIDANCE_DURATION_FRAMES = 120  # 6초 (30fps * 6)
-            AVOIDANCE_PHASE_1_DURATION = self.AVOIDANCE_DURATION_FRAMES * 0.3  # 30% 시간
-            AVOIDANCE_PHASE_2_DURATION = self.AVOIDANCE_DURATION_FRAMES * 0.15  # 30% 시간
-            AVOIDANCE_PHASE_3_DURATION = self.AVOIDANCE_DURATION_FRAMES * 0.4  # 20% 시간
-            AVOIDANCE_PHASE_4_DURATION = self.AVOIDANCE_DURATION_FRAMES * 0.15  # 20% 시간
-        else:
-            AVOIDANCE_PHASE_1_DURATION = self.AVOIDANCE_DURATION_FRAMES * 0.15  # 15% 시간
-            AVOIDANCE_PHASE_2_DURATION = self.AVOIDANCE_DURATION_FRAMES * 0.15  # 15% 시간
-            AVOIDANCE_PHASE_3_DURATION = self.AVOIDANCE_DURATION_FRAMES * 0.2   # 20% 시간
-            AVOIDANCE_PHASE_4_DURATION = self.AVOIDANCE_DURATION_FRAMES * 0.5   # 50% 시간
+        # # 왼쪽 회피 시 회피 지속 시간을 2배로 설정
+        # if self.avoidance_direction == 'left':
+        #     self.AVOIDANCE_DURATION_FRAMES = 120  # 6초 (30fps * 6)
+        #     AVOIDANCE_PHASE_1_DURATION = self.AVOIDANCE_DURATION_FRAMES * 0.3  # 30% 시간
+        #     AVOIDANCE_PHASE_2_DURATION = self.AVOIDANCE_DURATION_FRAMES * 0.15  # 30% 시간
+        #     AVOIDANCE_PHASE_3_DURATION = self.AVOIDANCE_DURATION_FRAMES * 0.4  # 20% 시간
+        #     AVOIDANCE_PHASE_4_DURATION = self.AVOIDANCE_DURATION_FRAMES * 0.15  # 20% 시간
+        # else:
+        #     AVOIDANCE_PHASE_1_DURATION = self.AVOIDANCE_DURATION_FRAMES * 0.15  # 15% 시간
+        #     AVOIDANCE_PHASE_2_DURATION = self.AVOIDANCE_DURATION_FRAMES * 0.15  # 15% 시간
+        #     AVOIDANCE_PHASE_3_DURATION = self.AVOIDANCE_DURATION_FRAMES * 0.2   # 20% 시간
+        #     AVOIDANCE_PHASE_4_DURATION = self.AVOIDANCE_DURATION_FRAMES * 0.5   # 50% 시간
+        self.AVOIDANCE_DURATION_FRAMES = 120  # 6초 (30fps * 6)
+        AVOIDANCE_PHASE_1_DURATION = self.AVOIDANCE_DURATION_FRAMES * 0.15  # 15% 시간
+        AVOIDANCE_PHASE_2_DURATION = self.AVOIDANCE_DURATION_FRAMES * 0.15  # 15% 시간
+        AVOIDANCE_PHASE_3_DURATION = self.AVOIDANCE_DURATION_FRAMES * 0.2   # 20% 시간
+        AVOIDANCE_PHASE_4_DURATION = self.AVOIDANCE_DURATION_FRAMES * 0.5   # 50% 시간
 
         # 회피 동작 중이라면 회피 로직 수행
         if self.avoidance_active:
