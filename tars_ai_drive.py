@@ -1,152 +1,151 @@
-import time
-from base_ctrl_js import BaseController
-import glob
-import threading
-import queue
-import numpy as np
+import requests
 import sounddevice as sd
-import scipy.io.wavfile as wav
+import numpy as np
+import wave
 import whisper
-import warnings
+import json
+import re
+import rclpy
+from rclpy.node import Node
+from geometry_msgs.msg import Twist
 
-# 경고 메시지 무시
-warnings.filterwarnings("ignore")
-
-SAMPLE_RATE = 16000
-CHANNELS = 1
-OUTPUT_FILE = "recorded_audio.wav"
-recording = []
-
-# Whisper 모델을 전역 변수로 한 번만 로드
-print("음성 인식 모델을 로드하는 중...")
-whisper_model = whisper.load_model("tiny.en")
-
-def audio_callback(indata, frames, time_info, status):
-    recording.append(indata.copy())
+AUDIO_FILE = "user_command.wav"
+SAMPLE_RATE = 44100
+DURATION = 5  # seconds
 
 def record_audio():
-    global recording
-    recording = []
-    print("🎤 음성을 녹음 중입니다... (Enter를 눌러 녹음을 종료하세요)")
-    
-    with sd.InputStream(samplerate=SAMPLE_RATE, channels=CHANNELS, callback=audio_callback):
-        input()  # Enter 키를 누를 때까지 대기
-    
-    audio_data = np.concatenate(recording, axis=0)
-    wav.write(OUTPUT_FILE, SAMPLE_RATE, audio_data)
+    print("🎙️ 녹음 중... 말하세요")
+    audio_data = sd.rec(int(SAMPLE_RATE * DURATION), samplerate=SAMPLE_RATE, channels=1, dtype='int16')
+    sd.wait()
+    wave_file = wave.open(AUDIO_FILE, 'wb')
+    wave_file.setnchannels(1)
+    wave_file.setsampwidth(2)
+    wave_file.setframerate(SAMPLE_RATE)
+    wave_file.writeframes(audio_data.tobytes())
+    wave_file.close()
+    print("✅ 녹음 완료")
 
 def transcribe_audio():
-    result = whisper_model.transcribe(OUTPUT_FILE)
-    return result["text"].strip().lower()
+    print("🔎 Whisper로 음성 텍스트 변환 중...")
+    model = whisper.load_model("base")
+    result = model.transcribe(AUDIO_FILE, language="ko")
+    return result['text']
 
-class TarsAIDriver:
-    def __init__(self):
-        # 시리얼 포트 찾기 및 BaseController 초기화
-        try:
-            available_ports = glob.glob('/dev/ttyUSB*')
-            if available_ports:
-                port = available_ports[0]
-                print(f"사용 가능한 시리얼 포트: {port}")
-                self.base = BaseController(port, 115200)
-            else:
-                print("시리얼 포트를 찾을 수 없습니다. 가상 모드로 실행합니다.")
-                self.base = BaseController("VIRTUAL", 115200)
-        except Exception as e:
-            print(f"초기화 오류: {e}")
-            self.base = BaseController("VIRTUAL", 115200)
+def get_structured_command_from_model(user_input):
+    url = "http://localhost:11434/api/generate"
+    system_prompt = """
+You are a robotic driving assistant. Your job is to interpret voice commands in Korean or English and convert them into a structured JSON command. Use this format:
 
-        # 제어 관련 변수
-        self.running = True
-        self.command_queue = queue.Queue()
-        self.last_update_time = time.time()
-        self.UPDATE_INTERVAL = 0.1  # 100ms 간격으로 제어 명령 전송
+{
+  "task_type": "navigate" | "manual_command" | "unknown",
+  "action": "stop" | "go_forward" | "go_backward" | "turn_left" | "turn_right" | "turn_around" | null,
+  "parameters": {
+    "speed": "fast" | "normal" | "slow" | null,
+    "destination": "school" | "home" | "work" | null
+  }
+}
 
-        # 기본 제어 파라미터
-        self.linear_speed = 0.0
-        self.angular_speed = 0.0
-        self.MAX_SPEED = 0.5
-        self.MAX_STEER = 0.3
+Only return JSON between triple backticks.
+"""
+    full_prompt = f"{system_prompt}\n\nUser: {user_input}\nAssistant:"
 
-        # 음성 명령 매핑
-        self.command_mapping = {
-            'go': (0.3, 0.0),      # 전진
-            'back': (-0.3, 0.0),   # 후진
-            'left': (0.5, 0.3),    # 좌회전
-            'right': (0.5, -0.3),  # 우회전
-            'stop': (0.0, 0.0)     # 정지
+    data = {
+        "model": "phi4-mini",
+        "prompt": full_prompt,
+        "stream": False,
+        "options": {
+            "temperature": 0.4,
+            "top_p": 0.9,
+            "top_k": 40,
+            "num_predict": 150
         }
+    }
 
-    def update_robot(self):
-        """로봇의 속도와 방향을 업데이트"""
-        self.base.base_velocity_ctrl(self.linear_speed, self.angular_speed)
+    try:
+        response = requests.post(url, json=data)
+        response.raise_for_status()
+        result = response.json()
+        text = result.get("response", "")
 
-    def set_velocity(self, linear_x, angular_z):
-        """선형 속도와 각속도 설정"""
-        # 속도 제한 적용
-        self.linear_speed = np.clip(linear_x, -self.MAX_SPEED, self.MAX_SPEED)
-        self.angular_speed = np.clip(angular_z, -self.MAX_STEER, self.MAX_STEER)
-
-    def stop(self):
-        """로봇 정지"""
-        self.linear_speed = 0.0
-        self.angular_speed = 0.0
-        self.update_robot()
-
-    def process_voice_command(self, command):
-        """음성 명령 처리"""
-        # 명령어 텍스트 정리 (소문자 변환, 특수문자 제거)
-        command = command.lower().strip('!.,?')
-        
-        # 명령어 매핑에서 가장 잘 매칭되는 명령 찾기
-        best_match = None
-        for cmd in self.command_mapping.keys():
-            if cmd in command:
-                best_match = cmd
-                break
-        
-        if best_match:
-            linear, angular = self.command_mapping[best_match]
-            self.set_velocity(linear, angular)
-            print(f"명령 실행: {best_match} (선속도: {linear}, 각속도: {angular})")
+        # Extract JSON
+        match = re.search(r"```(.*?)```", text, re.DOTALL)
+        if match:
+            return json.loads(match.group(1))
         else:
-            print(f"알 수 없는 명령: {command}")
-            print("사용 가능한 명령어: go, back, left, right, stop")
+            return {"task_type": "unknown"}
+
+    except Exception as e:
+        print(f"⚠️ Error in LLM call: {e}")
+        return {"task_type": "unknown"}
+
+def execute_command_from_json(driver, command):
+    task = command.get("task_type")
+    action = command.get("action")
+    params = command.get("parameters", {})
+
+    if task == "navigate":
+        speed_map = {"fast": 0.5, "normal": 0.3, "slow": 0.15}
+        linear = speed_map.get(params.get("speed", "normal"), 0.3)
+        print(f"🧭 Navigating to {params.get('destination')} at speed '{params.get('speed')}' → {linear}")
+        driver.set_velocity(linear, 0.0)
+
+    elif task == "manual_command":
+        cmd_map = {
+            "stop": (0.0, 0.0),
+            "go_forward": (0.3, 0.0),
+            "go_backward": (-0.3, 0.0),
+            "turn_left": (0.3, 0.3),
+            "turn_right": (0.3, -0.3),
+            "turn_around": (0.3, -0.5)
+        }
+        if action in cmd_map:
+            linear, angular = cmd_map[action]
+            print(f"🎮 Manual Command: {action} → 선속도 {linear}, 각속도 {angular}")
+            driver.set_velocity(linear, angular)
+        else:
+            print("⚠️ Unknown manual command.")
+
+    else:
+        print("🤷‍♂️ 명령을 이해하지 못했습니다.")
+
+def handle_user_voice_command(driver):
+    record_audio()
+    transcript = transcribe_audio()
+    print(f"\n🗣️ 사용자: {transcript}")
+    command_json = get_structured_command_from_model(transcript)
+    print(f"\n📦 파싱된 명령: {json.dumps(command_json, indent=2, ensure_ascii=False)}")
+    execute_command_from_json(driver, command_json)
+
+class TarsAIDriver(Node):
+    def __init__(self):
+        super().__init__('tars_ai_driver')
+        self.cmd_pub = self.create_publisher(Twist, 'cmd_vel', 10)
+        self.running = True
+
+    def set_velocity(self, linear, angular):
+        twist = Twist()
+        twist.linear.x = linear
+        twist.angular.z = angular
+        self.cmd_pub.publish(twist)
 
     def run(self):
-        """메인 제어 루프"""
-        print("음성 제어 모드 시작...")
-        print("사용 가능한 명령어: go, back, left, right, stop")
-        print("Enter를 눌러 음성 명령을 입력하세요. 종료하려면 'quit'를 입력하세요.")
-        
-        try:
-            while self.running:
-                user_input = input("\n🔘 [Enter]를 눌러 음성 입력을 시작하세요 (또는 'quit' 입력):").strip()
-                
-                if user_input.lower() == 'quit':
-                    break
-                
-                if not user_input:
-                    record_audio()
-                    command = transcribe_audio()
-                    print(f"\n👤 음성 입력: {command}")
-                    self.process_voice_command(command)
-                
-                # 주기적으로 로봇 상태 업데이트
-                current_time = time.time()
-                if current_time - self.last_update_time >= self.UPDATE_INTERVAL:
-                    self.update_robot()
-                    self.last_update_time = current_time
-                
-                time.sleep(0.01)  # CPU 사용량 감소를 위한 짧은 대기
+        print("🚗 TARS AI Driver 실행 중 (Enter를 눌러 명령)")
+        while self.running:
+            key = input("\n🔘 [Enter]를 눌러 말하거나 'q'로 종료:")
+            if key.strip().lower() == 'q':
+                self.set_velocity(0.0, 0.0)
+                self.running = False
+                break
+            handle_user_voice_command(self)
 
-        except KeyboardInterrupt:
-            print("\n사용자에 의해 중단됨")
-        except Exception as e:
-            print(f"\n오류 발생: {e}")
-        finally:
-            self.stop()
-            print("음성 제어 모드 종료")
-
-if __name__ == "__main__":
+def main():
+    rclpy.init()
     driver = TarsAIDriver()
-    driver.run() 
+    try:
+        driver.run()
+    finally:
+        driver.destroy_node()
+        rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
