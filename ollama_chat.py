@@ -5,9 +5,16 @@ import scipy.io.wavfile as wav
 import numpy as np
 import whisper
 import warnings
+from openai import OpenAI
 
 # 경고 메시지 무시
 warnings.filterwarnings("ignore")
+
+# Ollama API 설정
+client = OpenAI(
+    base_url="http://localhost:11434/v1",
+    api_key="not-needed"  # Ollama는 API 키가 필요하지 않음
+)
 
 SAMPLE_RATE = 16000
 CHANNELS = 1
@@ -38,7 +45,7 @@ def transcribe_audio():
 
 def chat_with_phi4(prompt):
     """
-    Ollama를 통해 phi4-mini 모델과 대화하는 함수
+    Ollama를 통해 phi4-mini 모델과 대화하는 함수 (OpenAI 클라이언트 사용)
     
     Args:
         prompt (str): 사용자의 입력 메시지
@@ -46,32 +53,26 @@ def chat_with_phi4(prompt):
     Returns:
         str: 모델의 응답
     """
-    url = "http://localhost:11434/api/generate"
-    
-    # 시스템 프롬프트 추가하여 짧은 답변 유도
-    system_prompt = "You are a concise assistant. Keep your responses brief and to the point, under 2-3 sentences."
-    full_prompt = f"{system_prompt}\n\nUser: {prompt}\nAssistant:"
-    
-    data = {
-        "model": "phi4-mini",
-        "prompt": full_prompt,
-        "stream": False,
-        "options": {
-            "num_predict": 10,  # 최대 토큰 수 제한
-            "temperature": 0.7,  # 창의성과 일관성의 균형
-            "top_p": 0.9,  # 더 결정적인 응답을 위해
-            "top_k": 40  # 더 집중된 응답을 위해
-        }
-    }
-    
     try:
-        response = requests.post(url, json=data)
-        response.raise_for_status()
+        response = client.chat.completions.create(
+            model="phi4-mini",
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are a concise assistant. Keep your responses brief and to the point, under 2-3 sentences."
+                },
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
+            temperature=0.7,
+            max_tokens=10
+        )
         
-        result = response.json()
-        return result.get('response', '응답을 받지 못했습니다.')
+        return response.choices[0].message.content
     
-    except requests.exceptions.RequestException as e:
+    except Exception as e:
         return f"에러 발생: {str(e)}"
 
 def main():
