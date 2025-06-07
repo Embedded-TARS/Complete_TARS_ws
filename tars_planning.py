@@ -297,6 +297,23 @@ class EnhancedLanePlanner:
         
         return None, None
 
+    def calculate_pure_pursuit(self, target_x, lookahead_distance=None):
+        """
+        Pure Pursuit 알고리즘을 사용하여 조향각을 계산하는 함수
+        
+        Args:
+            target_x (float): 목표점의 x 좌표 (차량 기준 좌표계)
+            lookahead_distance (float, optional): 전방 주시 거리. None인 경우 기본값 사용
+            
+        Returns:
+            float: 계산된 조향각
+        """
+        if lookahead_distance is None:
+            lookahead_distance = self.LOOKAHEAD_DISTANCE
+            
+        steering_angle = np.arctan2(2 * self.WHEELBASE * target_x, lookahead_distance**2)
+        return np.clip(steering_angle * self.STEERING_GAIN, -self.MAX_STEER, self.MAX_STEER)
+
     def calculate_lane_following(self, lane_center_x, image_center_x, detected_objects=None):
         """
         Pure Pursuit 기반 차선 추종 로직 및 회피 주행 로직
@@ -366,8 +383,7 @@ class EnhancedLanePlanner:
         deviation = np.clip(deviation, -1.0, 1.0)
 
         target_x = self.LOOKAHEAD_DISTANCE * deviation
-        steering_angle = np.arctan2(2 * self.WHEELBASE * target_x, self.LOOKAHEAD_DISTANCE**2)
-        steering = np.clip(steering_angle * self.STEERING_GAIN, -self.MAX_STEER, self.MAX_STEER)
+        steering = self.calculate_pure_pursuit(target_x)
 
         # 조향 각도에 따라 속도 조정
         if abs(steering) > self.TURN_THRESHOLD:
@@ -416,8 +432,27 @@ class EnhancedLanePlanner:
                     else:  # normal
                         speed = self.STRAIGHT_SPEED
                     
-                    # 목적지에 따른 기본 조향 설정
-                    return speed, 0.0, 0.0
+                    # 목적지에 따른 Pure Pursuit 기반 주행
+                    destination_classes = {
+                        "home": 5,  # car
+                        "office": 6,  # bus
+                        "airport": 6,  # bus
+                        "school": 7   # motorcycle
+                    }
+                    
+                    target_class = destination_classes.get(destination)
+                    if target_class is not None:
+                        # Pure Pursuit 알고리즘을 사용한 조향 계산
+                        target_x = self.LOOKAHEAD_DISTANCE * 0.5  # 목적지 방향으로의 목표점
+                        steering = self.calculate_pure_pursuit(target_x)
+                        
+                        # 목적지 클래스에 따라 조향 방향 조정
+                        if target_class % 2 == 0:  # 짝수 클래스는 왼쪽으로
+                            steering = -abs(steering)
+                        else:  # 홀수 클래스는 오른쪽으로
+                            steering = abs(steering)
+                            
+                        return speed, steering, 0.0
             
             # 알 수 없는 명령이나 task_type이 unknown인 경우
             return self.MIN_SPEED, 0.0, 0.0

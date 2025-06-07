@@ -146,7 +146,7 @@ class CommandHandler:
         with self.command_lock:
             self.current_command = None
 
-def main(display_mode=True):
+def main(display_mode=True, use_llm=False):
     # 명령 핸들러 초기화 및 시작
     command_handler = CommandHandler()
     command_handler.start_server()
@@ -159,8 +159,23 @@ def main(display_mode=True):
     camera_manager = CameraManager.get_instance()
     camera_manager.initialize_camera(width=CAMERA_WIDTH, height=CAMERA_HEIGHT, capture_fps=CAMERA_FPS)
 
+    # LLM 모드일 경우 추가 초기화
+    if use_llm:
+        try:
+            from tars_llm import LLMController
+            llm_controller = LLMController()
+            print("🤖 LLM 컨트롤러 초기화 완료")
+        except ImportError:
+            print("❌ LLM 모듈을 찾을 수 없습니다. 기본 모드로 전환합니다.")
+            use_llm = False
+
     print("🚗 자율주행 모드 시작 - q 키를 눌러 종료, 스페이스바로 일시정지/재시작")
-    print("JSON 명령을 기다리는 중...")
+    if use_llm:
+        print("🤖 LLM 기반 자율주행 모드 - JSON 명령을 기다리는 중...")
+    elif display_mode:
+        print("📺 화면 표시 자율주행 모드")
+    else:
+        print("🔇 화면 미표시 자율주행 모드")
     
     is_paused = False
     old_terminal_settings = set_terminal_mode()
@@ -171,8 +186,8 @@ def main(display_mode=True):
             # 현재 명령 확인
             current_command = command_handler.get_current_command()
             
-            if current_command is None:
-                # 명령이 없으면 대기하면서 키 입력 체크
+            if use_llm and current_command is None:
+                # LLM 모드에서 명령이 없으면 대기
                 status = [
                     "=== 자율주행 상태 ===",
                     "상태: 명령 대기 중...",
@@ -182,6 +197,8 @@ def main(display_mode=True):
                     "현재 명령: 없음",
                     "JSON 명령을 기다리는 중... (종료하려면 'q' 키를 누르세요)"
                 ]
+                if use_llm:
+                    status.append("모드: LLM 기반 자율주행")
                 print_status_clean(status)
                 
                 if is_key_pressed():
@@ -204,23 +221,51 @@ def main(display_mode=True):
             results = lane_model.predict(frame)
             lane_center_x = perception.update(results[0], roi=roi)
 
-            if lane_center_x is not None:
-                linear_speed, steering, deviation, state, detected_objects = planner.plan_with_objects(frame, lane_center_x, img_center_x)
+            if use_llm:
+                # LLM 기반 제어
+                linear_speed, steering, deviation, state, detected_objects = llm_controller.plan(
+                    frame, lane_center_x, img_center_x, current_command
+                )
             else:
-                linear_speed = 0.3
-                steering = 0.0
-                deviation = 0.0
-                state = "no_lane_detected"
-                detected_objects = []
+                # 기존 차선 추적 기반 제어
+                if lane_center_x is not None:
+                    linear_speed, steering, deviation, state, detected_objects = planner.plan_with_objects(frame, lane_center_x, img_center_x)
+                else:
+                    linear_speed = 0.3
+                    steering = 0.0
+                    deviation = 0.0
+                    state = "no_lane_detected"
+                    detected_objects = []
 
             status = [
                 "=== 자율주행 상태 ===",
                 f"상태: {state}",
                 f"속도: {linear_speed:.2f} m/s",
                 f"조향: {steering:.2f} rad/s",
-                f"주행: {'일시정지' if is_paused else '주행중'}",
-                f"현재 명령: {current_command}"
+                f"주행: {'일시정지' if is_paused else '주행중'}"
             ]
+            
+            if use_llm:
+                status.append("모드: LLM 기반 자율주행")
+                if hasattr(llm_controller, 'get_current_plan'):
+                    plan_info = llm_controller.get_current_plan()
+                    status.append(f"LLM 계획: {plan_info}")
+                if current_command:
+                    status.append(f"현재 명령: {current_command}")
+            
+            # 진행 방향과 목적지 정보 추가 (LLM 모드일 때만)
+            if use_llm and current_command and 'destination' in current_command:
+                dest = current_command['destination']
+                status.append(f"목적지: {dest}")
+                
+                # 조향 각도에 따른 진행 방향 표시
+                if steering > 0.1:
+                    direction = "우회전"
+                elif steering < -0.1:
+                    direction = "좌회전"
+                else:
+                    direction = "직진"
+                status.append(f"진행 방향: {direction} (조향각: {steering:.2f} rad)")
             
             if detected_objects:
                 status.append(f"객체: {len(detected_objects)}개")
@@ -241,6 +286,8 @@ def main(display_mode=True):
                 
                 if is_paused:
                     cv2.putText(frame_with_objects, "PAUSED", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+                elif use_llm:
+                    cv2.putText(frame_with_objects, "LLM MODE", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
 
             if is_key_pressed():
                 key = get_key()
@@ -262,8 +309,8 @@ def main(display_mode=True):
                     is_paused = not is_paused
                     print(f"\n{'⏸️  일시정지 상태' if is_paused else '▶️  주행 재시작'}")
 
-            # 목적지 도착 확인 로직 (예시)
-            if current_command.get('destination_reached', False):
+            # 목적지 도착 확인 로직 (LLM 모드일 때만)
+            if use_llm and current_command and current_command.get('destination_reached', False):
                 print("목적지에 도착했습니다. 다음 명령을 기다립니다...")
                 command_handler.clear_current_command()
 
@@ -303,6 +350,7 @@ def print_menu():
     print("\n===== 모드 선택 =====")
     print("a: 자율주행 (lane tracking) - 화면 표시")
     print("an: 자율주행 (lane tracking) - 화면 미표시")
+    print("al: 자율주행 (LLM 기반) - 화면 표시")
     print("mp: 메뉴얼 (Pygame)")
     print("mt: 메뉴얼 (Terminal) - 비디오 녹화 포함")
     print("c: 카메라 테스트")
@@ -316,7 +364,7 @@ def print_menu():
 def main_menu():
     while True:
         print_menu()
-        mode = input("모드 선택 (a/an/mp/mt/c/cc/cal/q/x): ").strip().lower()
+        mode = input("모드 선택 (a/an/al/mp/mt/c/cc/cal/q/x): ").strip().lower()
 
         if mode == 'a':
             result = main(display_mode=True)  # 자율주행 모드 실행 (화면 표시)
@@ -324,6 +372,10 @@ def main_menu():
                 continue
         elif mode == 'an':
             result = main(display_mode=False)  # 자율주행 모드 실행 (화면 미표시)
+            if result == 'menu':
+                continue
+        elif mode == 'al':
+            result = main(display_mode=True, use_llm=True)  # LLM 기반 자율주행 모드 실행
             if result == 'menu':
                 continue
         elif mode == 'mp':
