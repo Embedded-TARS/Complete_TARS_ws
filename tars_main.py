@@ -25,6 +25,9 @@ from tars_config import (  # 설정 모듈 임포트
     get_roi_slice, CAMERA_WIDTH, CAMERA_HEIGHT, CAMERA_FPS, 
     LANE_WIDTH_PX, EMA_ALPHA, CAPTURE_DIR
 )
+import json
+import socket
+import threading
 
 # 베이스 컨트롤러 초기화
 available_ports = glob.glob('/dev/ttyUSB*')
@@ -77,7 +80,77 @@ def print_status_clean(status_lines):
     # 커서를 다시 상태 출력 아래로 이동
     print(f"\033[{len(status_lines)+1}H", end="", flush=True)
 
+class CommandHandler:
+    def __init__(self, host='0.0.0.0', port=5000):
+        self.host = host
+        self.port = port
+        self.server_socket = None
+        self.current_command = None
+        self.command_lock = threading.Lock()
+        self.is_running = False
+        self.server_thread = None
+
+    def start_server(self):
+        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.server_socket.bind((self.host, self.port))
+        self.server_socket.listen(1)
+        self.is_running = True
+        self.server_thread = threading.Thread(target=self._listen_for_commands)
+        self.server_thread.daemon = True
+        self.server_thread.start()
+        print(f"명령 서버가 시작되었습니다. 포트: {self.port}")
+
+    def stop_server(self):
+        print("서버 종료 중...")
+        self.is_running = False
+        if self.server_socket:
+            try:
+                # 서버 소켓을 닫기 전에 타임아웃 설정
+                self.server_socket.settimeout(1.0)
+                # 서버 소켓을 닫음
+                self.server_socket.close()
+            except Exception as e:
+                print(f"서버 소켓 종료 중 오류: {e}")
+        
+        if self.server_thread and self.server_thread.is_alive():
+            try:
+                # 스레드가 종료될 때까지 최대 2초 대기
+                self.server_thread.join(timeout=2.0)
+            except Exception as e:
+                print(f"서버 스레드 종료 중 오류: {e}")
+        
+        print("서버가 종료되었습니다.")
+
+    def _listen_for_commands(self):
+        while self.is_running:
+            try:
+                client_socket, addr = self.server_socket.accept()
+                print(f"클라이언트 연결됨: {addr}")
+                data = client_socket.recv(1024).decode('utf-8')
+                try:
+                    command = json.loads(data)
+                    with self.command_lock:
+                        self.current_command = command
+                    print(f"새로운 명령 수신: {command}")
+                except json.JSONDecodeError:
+                    print("잘못된 JSON 형식")
+                client_socket.close()
+            except Exception as e:
+                print(f"명령 수신 중 오류: {e}")
+
+    def get_current_command(self):
+        with self.command_lock:
+            return self.current_command
+
+    def clear_current_command(self):
+        with self.command_lock:
+            self.current_command = None
+
 def main(display_mode=True):
+    # 명령 핸들러 초기화 및 시작
+    command_handler = CommandHandler()
+    command_handler.start_server()
+
     # 자율주행 모듈 및 카메라 초기화
     lane_model = LaneDetectionModel(model_path="lane.pt", lane_class_id=12)
     perception = LanePerception(lane_width_px=LANE_WIDTH_PX, ema_alpha=EMA_ALPHA)
@@ -87,124 +160,143 @@ def main(display_mode=True):
     camera_manager.initialize_camera(width=CAMERA_WIDTH, height=CAMERA_HEIGHT, capture_fps=CAMERA_FPS)
 
     print("🚗 자율주행 모드 시작 - q 키를 눌러 종료, 스페이스바로 일시정지/재시작")
+    print("JSON 명령을 기다리는 중...")
     
-    is_paused = False  # 일시정지 상태를 추적하는 변수
-    
-    # 터미널 설정 변경 - cbreak 모드 사용
+    is_paused = False
     old_terminal_settings = set_terminal_mode()
-    
-    # 초기 화면 클리어
     clear_screen()
     
     try:
         while True:
+            # 현재 명령 확인
+            current_command = command_handler.get_current_command()
+            
+            if current_command is None:
+                # 명령이 없으면 대기하면서 키 입력 체크
+                status = [
+                    "=== 자율주행 상태 ===",
+                    "상태: 명령 대기 중...",
+                    "속도: 0.00 m/s",
+                    "조향: 0.00 rad/s",
+                    "주행: 대기",
+                    "현재 명령: 없음",
+                    "JSON 명령을 기다리는 중... (종료하려면 'q' 키를 누르세요)"
+                ]
+                print_status_clean(status)
+                
+                if is_key_pressed():
+                    key = get_key()
+                    if key == 'q':
+                        print("\n자율주행 모드를 종료하고 메인 메뉴로 돌아갑니다...")
+                        return 'menu'
+                time.sleep(0.1)
+                continue
+
             frame = camera_manager.get_frame()
             if frame is None:
                 print("❌ 프레임 수신 실패")
                 time.sleep(0.1)
                 continue
 
-            # 이미지 중앙 x 좌표 계산
             img_center_x = (frame.shape[1] // 2)
-
             roi = get_roi_slice(frame.shape[0]) 
 
-            # Perception: YOLO 추론 및 차선 감지
             results = lane_model.predict(frame)
             lane_center_x = perception.update(results[0], roi=roi)
 
-            # Planning: 속도 및 스티어링 결정
             if lane_center_x is not None:
                 linear_speed, steering, deviation, state, detected_objects = planner.plan_with_objects(frame, lane_center_x, img_center_x)
             else:
-                # 차선이 감지되지 않았을 때는 천천히 직진
-                linear_speed = 0.3  # 낮은 속도
-                steering = 0.0      # 직진
+                linear_speed = 0.3
+                steering = 0.0
                 deviation = 0.0
                 state = "no_lane_detected"
                 detected_objects = []
 
-            # 상태 정보 준비 - 간소화된 버전
             status = [
                 "=== 자율주행 상태 ===",
                 f"상태: {state}",
                 f"속도: {linear_speed:.2f} m/s",
                 f"조향: {steering:.2f} rad/s",
-                f"주행: {'일시정지' if is_paused else '주행중'}"
+                f"주행: {'일시정지' if is_paused else '주행중'}",
+                f"현재 명령: {current_command}"
             ]
             
-            # 객체가 검출된 경우에만 추가 정보 표시
             if detected_objects:
                 status.append(f"객체: {len(detected_objects)}개")
                 for obj in detected_objects:
-                    if obj['confidence'] > 0.5:  # 신뢰도가 50% 이상인 객체만 표시
+                    if obj['confidence'] > 0.5:
                         status.append(f"- {CLASS_INFO[obj['class']]['name']} ({obj['confidence']:.0%})")
             
             print_status_clean(status)
 
-            # Control: 로봇에 제어 명령 전송 (일시정지 상태가 아닐 때만)
             if not is_paused:
                 controller.send_control(linear_speed, steering)
             else:
-                controller.send_control(0, 0)  # 일시정지 상태일 때는 정지
+                controller.send_control(0, 0)
 
-            # 디스플레이 모드가 활성화된 경우에만 시각화 및 화면 표시
             if display_mode:
-                # 차선 인식 시각화를 위해 perception 모듈에 위임
                 frame_with_lanes = perception.visualize_lanes(frame, deviation, steering, roi)
-                
-                # 객체 인식 시각화 추가
                 frame_with_objects = planner.visualize_detections(frame_with_lanes, detected_objects)
                 
-                # 일시정지 상태 표시
                 if is_paused:
                     cv2.putText(frame_with_objects, "PAUSED", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-                
-                # 결과 이미지 출력
-                # cv2.imshow("YOLO-AutoDrive", frame_with_objects)
 
-            # 키 입력 처리 - 논블로킹 방식
             if is_key_pressed():
                 key = get_key()
                 if key == 'q':
-                    break
-                elif key == ' ':  # 스페이스바
+                    print("\n자율주행 모드를 종료하고 메인 메뉴로 돌아갑니다...")
+                    return 'menu'
+                elif key == 'm':
+                    print("\n메인 메뉴로 돌아갑니다...")
+                    return 'menu'
+                elif key == ' ':
                     is_paused = not is_paused
-                    # 상태 변경 알림을 화면 하단에 출력
                     print(f"\n{'⏸️  일시정지 상태' if is_paused else '▶️  주행 재시작'}")
             
-            # OpenCV 창의 키 입력도 처리 (디스플레이 모드가 활성화된 경우에만)
             if display_mode:
                 key = cv2.waitKey(1) & 0xFF
                 if key in (ord('q'), ord('Q')):
                     break
-                elif key == 32:  # 스페이스바
+                elif key == 32:
                     is_paused = not is_paused
                     print(f"\n{'⏸️  일시정지 상태' if is_paused else '▶️  주행 재시작'}")
 
+            # 목적지 도착 확인 로직 (예시)
+            if current_command.get('destination_reached', False):
+                print("목적지에 도착했습니다. 다음 명령을 기다립니다...")
+                command_handler.clear_current_command()
+
     except KeyboardInterrupt:
         print("\n\n자율주행 모드가 Ctrl+C로 중단되었습니다.")
+        return 'menu'
     except Exception as e:
         print(f"\n\n자율주행 모드 오류: {e}")
+        print("상세 오류 정보:")
+        import traceback
+        traceback.print_exc()
+        return 'menu'
     finally:
-        # 터미널 설정 복구
         restore_terminal_mode(old_terminal_settings)
-        
-        # 화면 클리어 후 종료 메시지
         clear_screen()
         print("🚗 자율주행 종료\n")
+        print("메인 메뉴로 돌아갑니다...")
         
-        # 자율주행 종료 시 정리 작업
+        try:
+            command_handler.stop_server()
+        except Exception as e:
+            print(f"서버 종료 중 오류 발생: {e}")
+        
         camera_manager.release_camera()
         if display_mode:
             cv2.destroyAllWindows()
         base.base_velocity_ctrl(0, 0)
         if hasattr(base, 'gimbal_dev_close'):
             pass
-        
-        # Add a shutdown call for the base controller if implemented
         if hasattr(base, 'shutdown'):
             base.shutdown()
+        
+        return 'menu'
 
 # 메인 메뉴 출력 함수
 def print_menu():
@@ -227,9 +319,13 @@ def main_menu():
         mode = input("모드 선택 (a/an/mp/mt/c/cc/cal/q/x): ").strip().lower()
 
         if mode == 'a':
-            main(display_mode=True)  # 자율주행 모드 실행 (화면 표시)
+            result = main(display_mode=True)  # 자율주행 모드 실행 (화면 표시)
+            if result == 'menu':
+                continue
         elif mode == 'an':
-            main(display_mode=False)  # 자율주행 모드 실행 (화면 미표시)
+            result = main(display_mode=False)  # 자율주행 모드 실행 (화면 미표시)
+            if result == 'menu':
+                continue
         elif mode == 'mp':
             controller = PygameKeyboardController(base)
             result = controller.run()

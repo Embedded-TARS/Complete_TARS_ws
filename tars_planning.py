@@ -9,6 +9,7 @@ from tars_config import (
     WHEELBASE, LOOKAHEAD_DISTANCE, MIN_DETECTION_AREAS
 )
 import cv2
+import json
 
 # 클래스 정보 매핑
 CLASS_INFO = {
@@ -46,6 +47,11 @@ class EnhancedLanePlanner:
         self.sign_model = YOLO(model_path).to(self.device)
         self.vehicle_classes = [5, 6, 7]  # car, bus, motorcycle
         self.min_detection_areas = MIN_DETECTION_AREAS
+        
+        # 목적지 관련 변수 추가
+        self.current_destination = None
+        self.destination_arrived = False
+        self.DESTINATION_ARRIVAL_THRESHOLD = 50000  # 5만 픽셀
         
         self.last_seen_sign = None
         self.last_action_time = 0
@@ -296,31 +302,39 @@ class EnhancedLanePlanner:
         Pure Pursuit 기반 차선 추종 로직 및 회피 주행 로직
         """
         self.current_frame_count += 1
-        AVOIDANCE_PHASE_1_DURATION = self.AVOIDANCE_DURATION_FRAMES * 0.15  # 15% 시간
-        AVOIDANCE_PHASE_2_DURATION = self.AVOIDANCE_DURATION_FRAMES * 0.15  # 15% 시간
-        AVOIDANCE_PHASE_3_DURATION = self.AVOIDANCE_DURATION_FRAMES * 0.2  # 20% 시간
-        AVOIDANCE_PHASE_4_DURATION = self.AVOIDANCE_DURATION_FRAMES * 0.5  # 50% 시간
+        # 회피 동작 단계 시간 조정
+        AVOIDANCE_PHASE_1_DURATION = self.AVOIDANCE_DURATION_FRAMES * 0.2  # 20% 시간 - 직진
+        AVOIDANCE_PHASE_2_DURATION = self.AVOIDANCE_DURATION_FRAMES * 0.15  # 15% 시간 - 회피 시작
+        AVOIDANCE_PHASE_3_DURATION = self.AVOIDANCE_DURATION_FRAMES * 0.25  # 25% 시간 - 회피 유지
+        AVOIDANCE_PHASE_4_DURATION = self.AVOIDANCE_DURATION_FRAMES * 0.2  # 20% 시간 - 복귀 시작
+        AVOIDANCE_PHASE_5_DURATION = self.AVOIDANCE_DURATION_FRAMES * 0.2  # 20% 시간 - 복귀 완료
 
         # 회피 동작 중이라면 회피 로직 수행
         if self.avoidance_active:
             elapsed = self.current_frame_count - self.avoidance_start_frame
 
             if elapsed < AVOIDANCE_PHASE_1_DURATION:
-                # 첫 번째 단계: 장애물 반대 방향으로 크게 조향
-                steering = -self.MAX_STEER * 0.6 if self.avoidance_direction == 'left' else self.MAX_STEER * 0.6
-                speed = self.MIN_SPEED
+                # 첫 번째 단계: 직진으로 거리 확보
+                steering = 0.0
+                speed = self.STRAIGHT_SPEED * 0.7  # 직진 속도의 70%
             elif elapsed < AVOIDANCE_PHASE_1_DURATION + AVOIDANCE_PHASE_2_DURATION:
-                # 두 번째 단계: 적당히 원래 방향으로 복귀
-                steering = self.MAX_STEER * 0.8 if self.avoidance_direction == 'left' else -self.MAX_STEER * 0.8
+                # 두 번째 단계: 부드럽게 회피 시작
+                progress = (elapsed - AVOIDANCE_PHASE_1_DURATION) / AVOIDANCE_PHASE_2_DURATION
+                steering = -self.MAX_STEER * 0.4 * progress if self.avoidance_direction == 'left' else self.MAX_STEER * 0.4 * progress
                 speed = self.MIN_SPEED
             elif elapsed < AVOIDANCE_PHASE_1_DURATION + AVOIDANCE_PHASE_2_DURATION + AVOIDANCE_PHASE_3_DURATION:
-                # 세 번째 단계: 직진
-                steering = 0.0
-                speed = 0.3
-            elif elapsed < AVOIDANCE_PHASE_1_DURATION + AVOIDANCE_PHASE_2_DURATION + AVOIDANCE_PHASE_3_DURATION + AVOIDANCE_PHASE_4_DURATION:
-                # 네 번째 단계: 장애물 방향으로 조향
-                steering = self.MAX_STEER * 0.8 if self.avoidance_direction == 'left' else -self.MAX_STEER * 0.8
+                # 세 번째 단계: 회피 유지
+                steering = -self.MAX_STEER * 0.4 if self.avoidance_direction == 'left' else self.MAX_STEER * 0.4
                 speed = self.MIN_SPEED
+            elif elapsed < AVOIDANCE_PHASE_1_DURATION + AVOIDANCE_PHASE_2_DURATION + AVOIDANCE_PHASE_3_DURATION + AVOIDANCE_PHASE_4_DURATION:
+                # 네 번째 단계: 부드럽게 복귀 시작
+                progress = (elapsed - (AVOIDANCE_PHASE_1_DURATION + AVOIDANCE_PHASE_2_DURATION + AVOIDANCE_PHASE_3_DURATION)) / AVOIDANCE_PHASE_4_DURATION
+                steering = -self.MAX_STEER * 0.4 * (1 - progress) if self.avoidance_direction == 'left' else self.MAX_STEER * 0.4 * (1 - progress)
+                speed = self.MIN_SPEED
+            elif elapsed < AVOIDANCE_PHASE_1_DURATION + AVOIDANCE_PHASE_2_DURATION + AVOIDANCE_PHASE_3_DURATION + AVOIDANCE_PHASE_4_DURATION + AVOIDANCE_PHASE_5_DURATION:
+                # 다섯 번째 단계: 복귀 완료 및 안정화
+                steering = 0.0
+                speed = self.STRAIGHT_SPEED * 0.5
             else:
                 # 회피 동작 종료 및 쿨다운 시작
                 self.avoidance_active = False
@@ -331,31 +345,12 @@ class EnhancedLanePlanner:
             print(f"🚧 회피 동작 실행 중: {self.avoidance_direction} (frame {elapsed})")
             return speed, steering, 0.0
 
-        # 차선 중심이 없으면 기본값 반환
-        if lane_center_x is None:
-            print("⚠️ 차선 중심이 감지되지 않았습니다.")
-            return 0.0, 0.0, 0.0
-
         # 장애물 감지 시 회피 조건 체크
         if detected_objects:
             print(f"🔍 감지된 객체 수: {len(detected_objects)}")
             for obj in detected_objects:
-                print(f"   - 객체 클래스: {obj['class']}, 면적: {obj['area']}, 위치: {obj.get('position', 'N/A')}")
                 if obj['class'] in self.vehicle_classes:
                     area = obj['area']
-                    if area > self.min_detection_areas.get(obj['class'], 2000):
-                        print(f"   ✅ 객체 면적 조건 충족 (면적: {area})")
-                    else:
-                        print(f"   ❌ 객체 면적 조건 미충족 (면적: {area})")
-                    if self.current_frame_count - self.last_avoidance_frame > self.AVOIDANCE_COOLDOWN_FRAMES:
-                        print(f"   ✅ 쿨다운 조건 충족 (쿨다운: {self.current_frame_count - self.last_avoidance_frame} 프레임)")
-                    else:
-                        print(f"   ❌ 쿨다운 조건 미충족 (쿨다운: {self.current_frame_count - self.last_avoidance_frame} 프레임)")
-                    if not self.avoidance_active:
-                        print("   ✅ 회피 동작이 비활성화 상태입니다.")
-                    else:
-                        print("   ❌ 회피 동작이 이미 활성화 상태입니다.")
-
                     if (area > self.min_detection_areas.get(obj['class'], 3000) and
                         self.current_frame_count - self.last_avoidance_frame > self.AVOIDANCE_COOLDOWN_FRAMES and
                         not self.avoidance_active):
@@ -364,7 +359,7 @@ class EnhancedLanePlanner:
                         self.avoidance_start_frame = self.current_frame_count
                         self.avoidance_direction = 'left' if obj['position'] == 'right' else 'right'
                         print(f"⚠️ 장애물 감지 - 회피 시작 ({self.avoidance_direction})")
-                        return self.MIN_SPEED, 0.0, 0.0
+                        return self.STRAIGHT_SPEED * 0.7, 0.0, 0.0  # 직진으로 시작
 
         # 정상 차선 추종 계산
         deviation = (lane_center_x - image_center_x) / image_center_x
@@ -382,6 +377,81 @@ class EnhancedLanePlanner:
 
         print(f"🚗 정상 주행: 속도={speed}, 조향={steering}, 편차={deviation}")
         return speed, steering, deviation
+
+    def process_llm_command(self, llm_output):
+        """LLM의 JSON 출력을 처리하여 주행 명령을 생성"""
+        try:
+            # JSON 문자열에서 실제 JSON 부분만 추출
+            json_str = llm_output.split("```json")[1].split("```")[0].strip()
+            command = json.loads(json_str)
+            
+            task_type = command.get("task_type", "unknown")
+            action = command.get("action", "")
+            parameters = command.get("parameters", {})
+            
+            if task_type == "manual_command":
+                if action == "stop":
+                    return 0.0, 0.0, 0.0  # 속도 0, 조향 0
+                elif action == "go_forward":
+                    return self.STRAIGHT_SPEED, 0.0, 0.0  # 직진 속도, 조향 0
+                elif action == "go_backward":
+                    return -self.STRAIGHT_SPEED, 0.0, 0.0  # 후진 속도, 조향 0
+                elif action == "turn_left":
+                    return self.MIN_SPEED, -self.MAX_STEER * 0.8, 0.0  # 좌회전
+                elif action == "turn_right":
+                    return self.MIN_SPEED, self.MAX_STEER * 0.8, 0.0  # 우회전
+                elif action == "turn_around":
+                    return self.MIN_SPEED, self.MAX_STEER, 0.0  # 180도 회전
+            
+            elif task_type == "navigate":
+                destination = parameters.get("destination")
+                if destination:
+                    self.current_destination = destination
+                    self.destination_arrived = False
+                    speed_setting = parameters.get("speed", "normal")
+                    if speed_setting == "fast":
+                        speed = self.MAX_SPEED
+                    elif speed_setting == "slow":
+                        speed = self.MIN_SPEED
+                    else:  # normal
+                        speed = self.STRAIGHT_SPEED
+                    
+                    # 목적지에 따른 기본 조향 설정
+                    return speed, 0.0, 0.0
+            
+            # 알 수 없는 명령이나 task_type이 unknown인 경우
+            return self.MIN_SPEED, 0.0, 0.0
+            
+        except Exception as e:
+            print(f"LLM 명령 처리 중 오류 발생: {e}")
+            return self.MIN_SPEED, 0.0, 0.0
+
+    def check_destination_arrival(self, detected_objects):
+        """목적지 도착 여부 확인"""
+        if not self.current_destination or self.destination_arrived:
+            return False
+
+        # 목적지에 해당하는 클래스 매핑
+        destination_classes = {
+            "home": 5,  # car
+            "office": 6,  # bus
+            "airport": 6,  # bus
+            "school": 7   # motorcycle
+        }
+
+        target_class = destination_classes.get(self.current_destination)
+        if target_class is None:
+            return False
+
+        for obj in detected_objects:
+            if obj['class'] == target_class:
+                area = obj['area']
+                if area >= self.DESTINATION_ARRIVAL_THRESHOLD:
+                    print(f"🎯 목적지 도착 감지: {self.current_destination} (면적: {area})")
+                    self.destination_arrived = True
+                    self.current_destination = None
+                    return True
+        return False
 
     def plan_with_objects(self, frame, lane_center_x, image_center_x):
         """객체 인식을 포함한 전체 계획 수립"""
@@ -410,17 +480,13 @@ class EnhancedLanePlanner:
                     deviation = 0.0
                 return speed, steering, deviation, sign_result, detected_objects
         
+        # 목적지 도착 확인 (신호등과 교통표지판 처리 후)
+        if self.check_destination_arrival(detected_objects):
+            return 0.0, 0.0, 0.0, "destination_arrived", detected_objects
+        
         # 기본 차선 추종
         speed, steering, deviation = self.calculate_lane_following(lane_center_x, image_center_x, detected_objects)
         return speed, steering, deviation, "lane_following", detected_objects
-
-    def plan(self, lane_center_x, image_center_x, frame=None):
-        """메인 계획 함수"""
-        if frame is not None:
-            speed, steering, deviation, state, objects = self.plan_with_objects(frame, lane_center_x, image_center_x)
-            return speed, steering, deviation
-        else:
-            return self.calculate_lane_following(lane_center_x, image_center_x)
 
     def get_detection_info(self):
         """현재 감지 상태 정보 반환"""
@@ -429,6 +495,18 @@ class EnhancedLanePlanner:
             "last_action_time": self.last_action_time,
             "current_state": self.current_state
         }
+
+    def plan(self, lane_center_x, image_center_x, frame=None, llm_output=None):
+        """메인 계획 함수"""
+        # LLM 명령이 있는 경우 우선 처리
+        if llm_output:
+            return self.process_llm_command(llm_output)
+            
+        if frame is not None:
+            speed, steering, deviation, state, objects = self.plan_with_objects(frame, lane_center_x, image_center_x)
+            return speed, steering, deviation
+        else:
+            return self.calculate_lane_following(lane_center_x, image_center_x)
 
     def visualize_detections(self, frame, detected_objects):
         # 감지된 객체를 시각화하여 반환
