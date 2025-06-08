@@ -20,7 +20,11 @@ CLASS_INFO = {
     9: {"name": "green light", "color": (30, 230, 64)},        # #40e61e -> BGR
     10: {"name": "yellow light", "color": (55, 250, 250)},     # #fafa37 -> BGR
     11: {"name": "red light", "color": (50, 50, 250)},         # #fa3253 -> BGR
-    12: {"name": "lane", "color": (77, 106, 255)}              # #ff6a4d -> BGR
+    12: {"name": "lane", "color": (77, 106, 255)},              # #ff6a4d -> BGR
+    13: {"name": "office", "color": (255, 128, 0)},  # 주황색
+    14: {"name": "school", "color": (128, 0, 255)},  # 보라색
+    15: {"name": "home", "color": (0, 255, 128)},    # 연두색
+    16: {"name": "airport", "color": (255, 0, 128)}  # 분홍색
 }
 
 def hex_to_bgr(hex_color):
@@ -33,12 +37,15 @@ def setup_object_detection():
     """객체 검출 모델 초기화"""
     device = 0 if torch.cuda.is_available() else "cpu"
     sign_model = YOLO("obj.pt").to(device)
-    return sign_model
+    dest_model = YOLO("destination.pt").to(device)
+    return sign_model, dest_model
 
-def detect_objects(frame, sign_model, min_area=1000):
+def detect_objects(frame, sign_model, dest_model, min_area=1000):
     """프레임에서 객체 검출 수행"""
     det_results = sign_model.predict(frame, verbose=False)
+    dest_results = dest_model.predict(frame, verbose=False)
     boxes = det_results[0].boxes
+    dest_boxes = dest_results[0].boxes
     detected_objects = []
     
     if boxes is not None:
@@ -57,6 +64,27 @@ def detect_objects(frame, sign_model, min_area=1000):
                     "confidence": conf,
                     "area": area
                 })
+    
+    # 목적지 객체 감지 결과 추가
+    if dest_boxes is not None:
+        for i in range(len(dest_boxes)):
+            xyxy = dest_boxes[i].xyxy[0].cpu().numpy()
+            raw_cls_id = int(dest_boxes[i].cls[0].item())
+            # 목적지 클래스 ID 매핑 (0->13, 1->14, 2->15, 3->16)
+            cls_id = raw_cls_id + 13
+            conf = float(dest_boxes[i].conf[0].item())
+            x1, y1, x2, y2 = map(int, xyxy)
+            area = (x2 - x1) * (y2 - y1)
+            
+            if area >= MIN_DETECTION_AREAS.get(cls_id, 3000):
+                detected_objects.append({
+                    "bbox": [x1, y1, x2, y2],
+                    "class": cls_id,
+                    "confidence": conf,
+                    "area": area,
+                    "raw_class": raw_cls_id  # 원본 클래스 ID도 저장
+                })
+                print(f"목적지 감지: {CLASS_INFO[cls_id]['name']} (원본 ID: {raw_cls_id} -> 매핑 ID: {cls_id})")
     
     return detected_objects
 
@@ -211,10 +239,10 @@ def process_vehicles(detected_objects, image_center_x, vehicle_classes=[5, 6, 7]
     
     return None, None
 
-def object_detection_pipeline(frame, sign_model, image_center_x, last_seen_sign, last_action_time):
+def object_detection_pipeline(frame, sign_model, dest_model, image_center_x, last_seen_sign, last_action_time):
     """전체 객체 검출 파이프라인"""
     # 1. 객체 검출
-    detected_objects = detect_objects(frame, sign_model)
+    detected_objects = detect_objects(frame, sign_model, dest_model, min_area=1000)
     boxes = sign_model.predict(frame, verbose=False)[0].boxes
     
     # 2. 신호등 처리
@@ -276,9 +304,9 @@ def add_info_overlay(frame, detected_objects, fps):
 
 def main():
     # 초기화
-    print("Initializing YOLO model...")
-    sign_model = setup_object_detection()
-    print("✅ YOLO model initialized")
+    print("Initializing YOLO models...")
+    sign_model, dest_model = setup_object_detection()
+    print("✅ YOLO models initialized")
     
     # 카메라 초기화
     print("Initializing camera...")
@@ -302,6 +330,9 @@ def main():
     
     prev_t = time.time()
     frame_count = 0
+    last_seen_sign = None
+    last_action_time = time.time()
+    image_center_x = CAMERA_WIDTH // 2
     
     try:
         while True:
@@ -314,8 +345,19 @@ def main():
                 
             frame_count += 1
             
+            # 객체 검출 파이프라인 실행
+            result, control, new_last_seen_sign, new_last_action_time = object_detection_pipeline(
+                frame, sign_model, dest_model, image_center_x, last_seen_sign, last_action_time
+            )
+            
+            # 상태 업데이트
+            if new_last_seen_sign is not None:
+                last_seen_sign = new_last_seen_sign
+            if new_last_action_time is not None:
+                last_action_time = new_last_action_time
+            
             # 객체 검출 수행
-            detected_objects = detect_objects(frame, sign_model, min_area=1000)
+            detected_objects = detect_objects(frame, sign_model, dest_model, min_area=1000)
             
             # FPS 계산
             current_time = time.time()
@@ -347,7 +389,7 @@ def main():
                     print("검출된 객체 없음")
             
             # 화면에 표시
-            # cv2.imshow('Object Detection with Annotations', final_frame)
+            cv2.imshow('Object Detection with Annotations', final_frame)
             
             # 'q' 키를 누르면 종료
             if cv2.waitKey(1) & 0xFF == ord('q'):

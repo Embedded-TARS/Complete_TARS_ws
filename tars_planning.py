@@ -6,16 +6,16 @@ import torch
 from ultralytics import YOLO
 from tars_config import (
     MAX_STEER, MAX_SPEED, MIN_SPEED, STRAIGHT_SPEED, TURN_THRESHOLD,
-    WHEELBASE, LOOKAHEAD_DISTANCE, MIN_DETECTION_AREAS
+    WHEELBASE, LOOKAHEAD_DISTANCE, MIN_DETECTION_AREAS, DESTINATION_ARRIVAL_THRESHOLD, DESTINATION_CLASSES
 )
 import cv2
 import json
 
 # 클래스 정보 매핑
 CLASS_INFO = {
-    0: {"name": "straight sign", "color": (255, 221, 51)},
-    1: {"name": "left sign", "color": (183, 209, 52)},
-    2: {"name": "right sign", "color": (51, 255, 221)},
+    # 0: {"name": "straight sign", "color": (255, 221, 51)},
+    # 1: {"name": "left sign", "color": (183, 209, 52)},
+    # 2: {"name": "right sign", "color": (51, 255, 221)},
     3: {"name": "pedestrian sign", "color": (83, 179, 36)},
     4: {"name": "stop sign", "color": (245, 61, 184)},
     5: {"name": "car", "color": (250, 183, 50)},
@@ -25,11 +25,15 @@ CLASS_INFO = {
     9: {"name": "green light", "color": (30, 230, 64)},
     10: {"name": "yellow light", "color": (55, 250, 250)},
     11: {"name": "red light", "color": (50, 50, 250)},
-    12: {"name": "lane", "color": (77, 106, 255)}
+    12: {"name": "lane", "color": (77, 106, 255)},
+    13: {"name": "office", "color": (255, 128, 0)},  # 주황색
+    14: {"name": "school", "color": (128, 0, 255)},  # 보라색
+    15: {"name": "home", "color": (0, 255, 128)},    # 연두색
+    16: {"name": "airport", "color": (255, 0, 128)}  # 분홍색
 }
 
 class EnhancedLanePlanner:
-    def __init__(self, model_path="obj.pt"):
+    def __init__(self, model_path="obj.pt", destination_model_path="destination.pt"):
         self.MAX_STEER = MAX_STEER
         self.MAX_SPEED = MAX_SPEED
         self.MIN_SPEED = MIN_SPEED
@@ -45,13 +49,15 @@ class EnhancedLanePlanner:
         
         self.device = 0 if torch.cuda.is_available() else "cpu"
         self.sign_model = YOLO(model_path).to(self.device)
+        self.destination_model = YOLO(destination_model_path).to(self.device)
         self.vehicle_classes = [5, 6, 7]  # car, bus, motorcycle
+        self.destination_classes = [13, 14, 15, 16]  # office, school, home, airport
         self.min_detection_areas = MIN_DETECTION_AREAS
         
         # 목적지 관련 변수 추가
         self.current_destination = None
         self.destination_arrived = False
-        self.DESTINATION_ARRIVAL_THRESHOLD = 50000  # 5만 픽셀
+        self.DESTINATION_ARRIVAL_THRESHOLD = DESTINATION_ARRIVAL_THRESHOLD
         
         self.last_seen_sign = None
         self.last_action_time = 0
@@ -132,8 +138,7 @@ class EnhancedLanePlanner:
                 
                 # 표지판 클래스(0,1,2,3,4)인 경우 표지판용 ROI 체크
                 elif cls_id in [0, 1, 2, 3, 4]:
-                    if obj_center_y < sign_roi_y:
-                        continue  # 표지판 ROI 밖의 객체는 무시
+                    continue  # 표지판 ROI 밖의 객체는 무시
                 
                 area = (x2 - x1) * (y2 - y1)
                 
@@ -157,6 +162,37 @@ class EnhancedLanePlanner:
                     })
         
         return detected_objects
+    
+    def detect_destination(self, frame):
+        """📍 목적지 객체 감지용 모델 실행"""
+        det_results = self.destination_model.predict(frame, verbose=False)
+        boxes = det_results[0].boxes
+        destination_objects = []
+
+        if boxes is not None:
+            for i in range(len(boxes)):
+                xyxy = boxes[i].xyxy[0].cpu().numpy()
+                raw_cls_id = int(boxes[i].cls[0].item())
+                conf = float(boxes[i].conf[0].item())
+                x1, y1, x2, y2 = map(int, xyxy)
+                area = (x2 - x1) * (y2 - y1)
+
+                # 목적지 클래스 ID 매핑 (0->13, 1->14, 2->15, 3->16)
+                cls_id = raw_cls_id + 13
+                
+                # 디버깅 정보 출력 (30프레임마다)
+                if self.current_frame_count % 30 == 0:
+                    print(f"목적지 감지: {CLASS_INFO[cls_id]['name']} (신뢰도: {conf:.2f}, 면적: {area})")
+
+                destination_objects.append({
+                    'class': cls_id,
+                    'confidence': conf,
+                    'area': area,
+                    'bbox': (x1, y1, x2, y2),
+                    'raw_class': raw_cls_id
+                })
+
+        return destination_objects
 
     def process_traffic_light(self, detected_objects):
         class_ids = [obj["class"] for obj in detected_objects]
@@ -216,9 +252,9 @@ class EnhancedLanePlanner:
                     self.turn_phase = "stop"
                     return "stop_after_turn", (0.0, 0.0)
             
-            elif self.turn_phase == "stop":
-                # 정지 상태 유지
-                return "stop_after_turn", (0.0, 0.0)
+            # elif self.turn_phase == "stop":
+            #     # 정지 상태 유지
+            #     return "stop_after_turn", (0.0, 0.0)
         
         # 정지 표지판 처리
         if 4 in class_ids and not self.stop_sign_detected:
@@ -297,7 +333,7 @@ class EnhancedLanePlanner:
         
         return None, None
 
-    def calculate_pure_pursuit(self, target_x, lookahead_distance=None):
+    def calculate_pure_pursuit(self, target_x, lookahead_distance=None): 
         """
         Pure Pursuit 알고리즘을 사용하여 조향각을 계산하는 함수
         
@@ -315,68 +351,29 @@ class EnhancedLanePlanner:
         return np.clip(steering_angle * self.STEERING_GAIN, -self.MAX_STEER, self.MAX_STEER)
 
     def calculate_lane_following(self, lane_center_x, image_center_x, detected_objects=None):
-        """
-        Pure Pursuit 기반 차선 추종 로직 및 회피 주행 로직
-        """
-        self.current_frame_count += 1
-        # 회피 동작 단계 시간 조정
-        AVOIDANCE_PHASE_1_DURATION = self.AVOIDANCE_DURATION_FRAMES * 0.2  # 20% 시간 - 직진
-        AVOIDANCE_PHASE_2_DURATION = self.AVOIDANCE_DURATION_FRAMES * 0.15  # 15% 시간 - 회피 시작
-        AVOIDANCE_PHASE_3_DURATION = self.AVOIDANCE_DURATION_FRAMES * 0.25  # 25% 시간 - 회피 유지
-        AVOIDANCE_PHASE_4_DURATION = self.AVOIDANCE_DURATION_FRAMES * 0.2  # 20% 시간 - 복귀 시작
-        AVOIDANCE_PHASE_5_DURATION = self.AVOIDANCE_DURATION_FRAMES * 0.2  # 20% 시간 - 복귀 완료
-
-        # 회피 동작 중이라면 회피 로직 수행
-        if self.avoidance_active:
-            elapsed = self.current_frame_count - self.avoidance_start_frame
-
-            if elapsed < AVOIDANCE_PHASE_1_DURATION:
-                # 첫 번째 단계: 직진으로 거리 확보
-                steering = 0.0
-                speed = self.STRAIGHT_SPEED * 0.7  # 직진 속도의 70%
-            elif elapsed < AVOIDANCE_PHASE_1_DURATION + AVOIDANCE_PHASE_2_DURATION:
-                # 두 번째 단계: 부드럽게 회피 시작
-                progress = (elapsed - AVOIDANCE_PHASE_1_DURATION) / AVOIDANCE_PHASE_2_DURATION
-                steering = -self.MAX_STEER * 0.4 * progress if self.avoidance_direction == 'left' else self.MAX_STEER * 0.4 * progress
-                speed = self.MIN_SPEED
-            elif elapsed < AVOIDANCE_PHASE_1_DURATION + AVOIDANCE_PHASE_2_DURATION + AVOIDANCE_PHASE_3_DURATION:
-                # 세 번째 단계: 회피 유지
-                steering = -self.MAX_STEER * 0.4 if self.avoidance_direction == 'left' else self.MAX_STEER * 0.4
-                speed = self.MIN_SPEED
-            elif elapsed < AVOIDANCE_PHASE_1_DURATION + AVOIDANCE_PHASE_2_DURATION + AVOIDANCE_PHASE_3_DURATION + AVOIDANCE_PHASE_4_DURATION:
-                # 네 번째 단계: 부드럽게 복귀 시작
-                progress = (elapsed - (AVOIDANCE_PHASE_1_DURATION + AVOIDANCE_PHASE_2_DURATION + AVOIDANCE_PHASE_3_DURATION)) / AVOIDANCE_PHASE_4_DURATION
-                steering = -self.MAX_STEER * 0.4 * (1 - progress) if self.avoidance_direction == 'left' else self.MAX_STEER * 0.4 * (1 - progress)
-                speed = self.MIN_SPEED
-            elif elapsed < AVOIDANCE_PHASE_1_DURATION + AVOIDANCE_PHASE_2_DURATION + AVOIDANCE_PHASE_3_DURATION + AVOIDANCE_PHASE_4_DURATION + AVOIDANCE_PHASE_5_DURATION:
-                # 다섯 번째 단계: 복귀 완료 및 안정화
-                steering = 0.0
-                speed = self.STRAIGHT_SPEED * 0.5
-            else:
-                # 회피 동작 종료 및 쿨다운 시작
-                self.avoidance_active = False
-                self.last_avoidance_frame = self.current_frame_count
-                print("✅ 회피 동작 완료 및 쿨다운 시작")
-                return self.calculate_lane_following(lane_center_x, image_center_x, [])
-
-            print(f"🚧 회피 동작 실행 중: {self.avoidance_direction} (frame {elapsed})")
-            return speed, steering, 0.0
-
-        # 장애물 감지 시 회피 조건 체크
+        # 장애물 감지 시 Pure Pursuit 기반 회피
         if detected_objects:
-            print(f"🔍 감지된 객체 수: {len(detected_objects)}")
             for obj in detected_objects:
                 if obj['class'] in self.vehicle_classes:
                     area = obj['area']
-                    if (area > self.min_detection_areas.get(obj['class'], 3000) and
-                        self.current_frame_count - self.last_avoidance_frame > self.AVOIDANCE_COOLDOWN_FRAMES and
-                        not self.avoidance_active):
-                        # 회피 동작 시작
-                        self.avoidance_active = True
-                        self.avoidance_start_frame = self.current_frame_count
-                        self.avoidance_direction = 'left' if obj['position'] == 'right' else 'right'
-                        print(f"⚠️ 장애물 감지 - 회피 시작 ({self.avoidance_direction})")
-                        return self.STRAIGHT_SPEED * 0.7, 0.0, 0.0  # 직진으로 시작
+                    if area > self.min_detection_areas.get(obj['class'], 3000):
+                        # 장애물이 왼쪽에 있으면 오른쪽으로, 오른쪽에 있으면 왼쪽으로 회피
+                        if 'position' in obj:
+                            if obj['position'] == 'left':
+                                # 오른쪽으로 회피하면서 직진 구간 추가
+                                target_x = self.LOOKAHEAD_DISTANCE * 0.3  # 직진 구간
+                                steering = self.calculate_pure_pursuit(target_x)
+                                speed = self.MIN_SPEED
+                                deviation = target_x / self.LOOKAHEAD_DISTANCE
+                                print(f"🚧 Pure Pursuit 회피 동작: 장애물 {obj['position']} (직진 후 회피)")
+                            else:
+                                # 왼쪽으로 회피하면서 직진 구간 추가
+                                target_x = -self.LOOKAHEAD_DISTANCE * 0.3  # 직진 구간
+                                steering = self.calculate_pure_pursuit(target_x)
+                                speed = self.MIN_SPEED
+                                deviation = target_x / self.LOOKAHEAD_DISTANCE
+                                print(f"🚧 Pure Pursuit 회피 동작: 장애물 {obj['position']} (직진 후 회피)")
+                            return speed, steering, deviation
 
         # 정상 차선 추종 계산
         deviation = (lane_center_x - image_center_x) / image_center_x
@@ -394,116 +391,179 @@ class EnhancedLanePlanner:
         print(f"🚗 정상 주행: 속도={speed}, 조향={steering}, 편차={deviation}")
         return speed, steering, deviation
 
-    def process_llm_command(self, llm_output):
+    def process_llm_command(self, llm_output, lane_center_x, image_center_x):
         """LLM의 JSON 출력을 처리하여 주행 명령을 생성"""
         try:
-            # JSON 문자열에서 실제 JSON 부분만 추출
-            json_str = llm_output.split("```json")[1].split("```")[0].strip()
-            command = json.loads(json_str)
+            # 이미 JSON 객체인 경우 바로 사용
+            command = llm_output if isinstance(llm_output, dict) else json.loads(llm_output)
             
             task_type = command.get("task_type", "unknown")
             action = command.get("action", "")
             parameters = command.get("parameters", {})
             
+            # 속도 제어 파라미터 처리
+            speed_control = parameters.get("speed_control", "normal")
+            base_speed = self.STRAIGHT_SPEED  # 기본 속도
+            
+            # 속도 제어에 따른 속도 조정
+            if speed_control == "slow":
+                base_speed = 0.2
+            elif speed_control == "fast":
+                base_speed = self.MAX_SPEED
+            elif speed_control == "normal":
+                base_speed = self.STRAIGHT_SPEED
+            
             if task_type == "manual_command":
                 if action == "stop":
-                    return 0.0, 0.0, 0.0  # 속도 0, 조향 0
+                    return 0.0, 0.0, 0.0, "stop", []  # 속도 0, 조향 0
                 elif action == "go_forward":
-                    return self.STRAIGHT_SPEED, 0.0, 0.0  # 직진 속도, 조향 0
+                    # 차선 추종을 사용한 직진
+                    if lane_center_x is None:
+                        return base_speed, 0.0, 0.0, "no_lane", []
+                    speed, steering, deviation = self.calculate_lane_following(lane_center_x, image_center_x, [])
+                    # 속도 제어 적용
+                    speed = min(speed, base_speed)
+                    return speed, steering, deviation, action, []
                 elif action == "go_backward":
-                    return -self.STRAIGHT_SPEED, 0.0, 0.0  # 후진 속도, 조향 0
+                    return -base_speed, 0.0, 0.0, action, []  # 후진 속도, 조향 0
                 elif action == "turn_left":
-                    return self.MIN_SPEED, -self.MAX_STEER * 0.8, 0.0  # 좌회전
+                    # Pure Pursuit을 사용한 좌회전
+                    target_x = -self.LOOKAHEAD_DISTANCE * 0.5  # 왼쪽으로 회전
+                    steering = self.calculate_pure_pursuit(target_x)
+                    return base_speed * 0.5, steering, -0.5, action, []  # 회전 시 속도 감소
                 elif action == "turn_right":
-                    return self.MIN_SPEED, self.MAX_STEER * 0.8, 0.0  # 우회전
+                    # Pure Pursuit을 사용한 우회전
+                    target_x = self.LOOKAHEAD_DISTANCE * 0.5  # 오른쪽으로 회전
+                    steering = self.calculate_pure_pursuit(target_x)
+                    return base_speed * 0.5, steering, 0.5, action, []  # 회전 시 속도 감소
                 elif action == "turn_around":
-                    return self.MIN_SPEED, self.MAX_STEER, 0.0  # 180도 회전
+                    # Pure Pursuit을 사용한 180도 회전
+                    target_x = self.LOOKAHEAD_DISTANCE  # 완전한 회전
+                    steering = self.calculate_pure_pursuit(target_x)
+                    return base_speed * 0.3, steering, 1.0, action, []  # 180도 회전 시 더 느리게
             
             elif task_type == "navigate":
                 destination = parameters.get("destination")
                 if destination:
+                    print(f"🎯 새로운 목적지 설정: {destination}")
                     self.current_destination = destination
                     self.destination_arrived = False
-                    speed_setting = parameters.get("speed", "normal")
-                    if speed_setting == "fast":
-                        speed = self.MAX_SPEED
-                    elif speed_setting == "slow":
-                        speed = self.MIN_SPEED
-                    else:  # normal
-                        speed = self.STRAIGHT_SPEED
-                    
-                    # 목적지에 따른 Pure Pursuit 기반 주행
-                    destination_classes = {
-                        "home": 5,  # car
-                        "office": 6,  # bus
-                        "airport": 6,  # bus
-                        "school": 7   # motorcycle
-                    }
-                    
-                    target_class = destination_classes.get(destination)
-                    if target_class is not None:
-                        # Pure Pursuit 알고리즘을 사용한 조향 계산
-                        target_x = self.LOOKAHEAD_DISTANCE * 0.5  # 목적지 방향으로의 목표점
-                        steering = self.calculate_pure_pursuit(target_x)
-                        
-                        # 목적지 클래스에 따라 조향 방향 조정
-                        if target_class % 2 == 0:  # 짝수 클래스는 왼쪽으로
-                            steering = -abs(steering)
-                        else:  # 홀수 클래스는 오른쪽으로
-                            steering = abs(steering)
-                            
-                        return speed, steering, 0.0
+                    # 목적지 설정만 하고, 주행은 차선 추종만 하다가 목적지가 보이면 정지
+                    if lane_center_x is None:
+                        return base_speed, 0.0, 0.0, "no_lane", []
+                    speed, steering, deviation = self.calculate_lane_following(lane_center_x, image_center_x, [])
+                    # 속도 제어 적용
+                    # speed = min(speed, base_speed)
+                    return speed, steering, deviation, "navigating", []
             
             # 알 수 없는 명령이나 task_type이 unknown인 경우
-            return self.MIN_SPEED, 0.0, 0.0
+            # 기본 차선 추종으로 대체
+            if lane_center_x is None:
+                return base_speed, 0.0, 0.0, "no_lane", []
+            speed, steering, deviation = self.calculate_lane_following(lane_center_x, image_center_x, [])
+            # 속도 제어 적용
+            # speed = min(speed, base_speed)
+            return speed, steering, deviation, "lane_following", []
             
         except Exception as e:
             print(f"LLM 명령 처리 중 오류 발생: {e}")
-            return self.MIN_SPEED, 0.0, 0.0
+            # 오류 발생 시 기본 차선 추종으로 대체
+            if lane_center_x is None:
+                return self.STRAIGHT_SPEED, 0.0, 0.0, "no_lane", []
+            speed, steering, deviation = self.calculate_lane_following(lane_center_x, image_center_x, [])
+            return speed, steering, deviation, "lane_following", []
 
-    def check_destination_arrival(self, detected_objects):
+    def check_destination_arrival(self, destination_objects):
         """목적지 도착 여부 확인"""
         if not self.current_destination or self.destination_arrived:
             return False
 
-        # 목적지에 해당하는 클래스 매핑
-        destination_classes = {
-            "home": 5,  # car
-            "office": 6,  # bus
-            "airport": 6,  # bus
-            "school": 7   # motorcycle
+        # 목적지 클래스 매핑
+        destination_mapping = {
+            "office": 13,
+            "school": 14,
+            "home": 15,
+            "airport": 16
         }
 
-        target_class = destination_classes.get(self.current_destination)
+        target_class = destination_mapping.get(self.current_destination)
         if target_class is None:
+            print(f"⚠️ 알 수 없는 목적지: {self.current_destination}")
             return False
 
-        for obj in detected_objects:
+        for obj in destination_objects:
             if obj['class'] == target_class:
                 area = obj['area']
-                if area >= self.DESTINATION_ARRIVAL_THRESHOLD:
-                    print(f"🎯 목적지 도착 감지: {self.current_destination} (면적: {area})")
+                conf = obj['confidence']
+                
+                if self.current_frame_count % 30 == 0:
+                    print(f"목적지 감지 중: {self.current_destination} (면적: {area}, 신뢰도: {conf:.2f})")
+                
+                if area >= self.DESTINATION_ARRIVAL_THRESHOLD and conf > 0.5:
+                    print(f"🎯 목적지 도착 감지: {self.current_destination}")
                     self.destination_arrived = True
                     self.current_destination = None
                     return True
         return False
 
-    def plan_with_objects(self, frame, lane_center_x, image_center_x):
-        """객체 인식을 포함한 전체 계획 수립"""
+    def plan_with_objects(self, frame, lane_center_x, image_center_x, current_command=None):
+        """객체 인식을 포함한 전체 계획 수립 + LLM 주행 중에도 감지 상황 반영"""
         detected_objects = self.detect_objects(frame)
-        
-        # 신호등 처리
+        destination_objects = self.detect_destination(frame)
+
+        # ✅ 목적지 도착 여부 확인
+        if self.current_destination and not self.destination_arrived:
+            if self.check_destination_arrival(destination_objects):
+                print("🎯 목적지 도착! 정지합니다.")
+                # 상태 초기화
+                self.last_seen_sign = None
+                self.last_action_time = 0
+                self.is_turning = False
+                self.turn_phase = "none"
+                self.stop_sign_detected = False
+                self.is_pedestrian_sign_active = False
+                self.current_state = "destination_arrived"
+                return 0.0, 0.0, 0.0, "destination_arrived", detected_objects
+
+        # ✅ LLM 명령 우선 처리
+        if current_command:
+            # LLM이 계획한 기본 주행 명령
+            speed, steering, deviation, state, _ = self.process_llm_command(current_command, lane_center_x, image_center_x)
+            # 🚦 신호등 감지 우선
+            traffic_result, traffic_control = self.process_traffic_light(detected_objects)
+            if traffic_result == "stop":
+                return 0.0, 0.0, 0.0, "red_light_stop", detected_objects
+            elif traffic_result == "go":
+                pass  # 초록불 → continue
+
+            # 🚧 장애물 감지 및 회피
+            for obj in detected_objects:
+                if obj['class'] in self.vehicle_classes and obj['area'] > self.min_detection_areas.get(obj['class'], 3000):
+                    print("⚠️ LLM 주행 중 장애물 감지 - 회피 수행")
+                    speed, steering, deviation = self.calculate_lane_following(lane_center_x, image_center_x, detected_objects)
+                    return speed, steering, deviation, "avoidance", detected_objects
+
+            # 🛑 표지판 감지
+            sign_result, sign_control = self.process_traffic_signs(detected_objects, lane_center_x, image_center_x)
+            if sign_result and sign_control:
+                s, st = sign_control
+                return s, st if st is not None else steering, deviation, sign_result, detected_objects
+
+            # 기본적으로 LLM 계획대로 실행
+            return speed, steering, deviation, state, detected_objects
+
+        # ✅ 일반 주행 모드
+        # 1. 신호등 처리
         traffic_result, traffic_control = self.process_traffic_light(detected_objects)
         if traffic_result:
             if traffic_control:
                 speed, steering = traffic_control
                 if steering is None:
-                    # 차선 추종을 위한 조향각 계산
                     _, lane_steering, deviation = self.calculate_lane_following(lane_center_x, image_center_x, detected_objects)
                     steering = lane_steering
                 return speed, steering, 0.0, traffic_result, detected_objects
-        
-        # 교통표지판 처리
+
+        # 2. 표지판 처리
         sign_result, sign_control = self.process_traffic_signs(detected_objects, lane_center_x, image_center_x)
         if sign_result:
             if sign_control:
@@ -514,14 +574,11 @@ class EnhancedLanePlanner:
                 else:
                     deviation = 0.0
                 return speed, steering, deviation, sign_result, detected_objects
-        
-        # 목적지 도착 확인 (신호등과 교통표지판 처리 후)
-        if self.check_destination_arrival(detected_objects):
-            return 0.0, 0.0, 0.0, "destination_arrived", detected_objects
-        
-        # 기본 차선 추종
+
+        # 3. 차선 추종 (기본)
         speed, steering, deviation = self.calculate_lane_following(lane_center_x, image_center_x, detected_objects)
         return speed, steering, deviation, "lane_following", detected_objects
+
 
     def get_detection_info(self):
         """현재 감지 상태 정보 반환"""
@@ -535,7 +592,7 @@ class EnhancedLanePlanner:
         """메인 계획 함수"""
         # LLM 명령이 있는 경우 우선 처리
         if llm_output:
-            return self.process_llm_command(llm_output)
+            return self.process_llm_command(llm_output, lane_center_x, image_center_x)
             
         if frame is not None:
             speed, steering, deviation, state, objects = self.plan_with_objects(frame, lane_center_x, image_center_x)
@@ -544,21 +601,56 @@ class EnhancedLanePlanner:
             return self.calculate_lane_following(lane_center_x, image_center_x)
 
     def visualize_detections(self, frame, detected_objects):
-        # 감지된 객체를 시각화하여 반환
+        """감지된 객체를 시각화하여 반환"""
         vis_frame = frame.copy()
         
         for obj in detected_objects:
             x1, y1, x2, y2 = obj['bbox']
             cls_id = obj['class']
-            color = CLASS_INFO[cls_id]['color']
+            
+            # 클래스 정보 가져오기
+            if cls_id in CLASS_INFO:
+                class_name = CLASS_INFO[cls_id]['name']
+                color = CLASS_INFO[cls_id]['color']
+            else:
+                class_name = f"Unknown_{cls_id}"
+                color = (128, 128, 128)  # 회색
+            
+            # 바운딩 박스 그리기
             cv2.rectangle(vis_frame, (x1, y1), (x2, y2), color, 2)
             
-            # 차량 클래스인 경우에만 위치 정보 표시
-            if cls_id in self.vehicle_classes and 'position' in obj:
-                label = f"{CLASS_INFO[cls_id]['name']} ({obj['position']})"
-            else:
-                label = CLASS_INFO[cls_id]['name']
+            # 라벨 텍스트 준비
+            conf = obj['confidence']
+            label = f"{class_name}: {conf:.2f}"
+            
+            # 텍스트 크기 계산
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            font_scale = 0.6
+            thickness = 2
+            (text_width, text_height), baseline = cv2.getTextSize(label, font, font_scale, thickness)
+            
+            # 라벨 배경 그리기
+            cv2.rectangle(vis_frame, 
+                         (x1, y1 - text_height - baseline - 5), 
+                         (x1 + text_width, y1), 
+                         color, -1)
+            
+            # 라벨 텍스트 그리기
+            cv2.putText(vis_frame, label, 
+                       (x1, y1 - baseline - 2), 
+                       font, font_scale, (255, 255, 255), thickness)
+            
+            # 목적지인 경우 특별한 표시 추가
+            if cls_id in [13, 14, 15, 16]:  # 목적지 클래스
+                # 중앙점 표시
+                center_x, center_y = (x1 + x2) // 2, (y1 + y2) // 2
+                cv2.circle(vis_frame, (center_x, center_y), 5, color, -1)
                 
-            cv2.putText(vis_frame, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                # 목적지 도착 임계값 표시
+                if obj['area'] >= self.DESTINATION_ARRIVAL_THRESHOLD:
+                    cv2.putText(vis_frame, "ARRIVAL", 
+                               (x1, y2 + 20), 
+                               font, 0.7, (0, 255, 0), 2)
         
         return vis_frame
+

@@ -53,6 +53,21 @@ UPDATE_INTERVAL = 0.05  # 업데이트 간격(초)
 CAPTURE_DIR = "./captures"
 VIDEO_DIR = "./videos"
 
+# 목적지 관련 설정
+DESTINATION_CLASSES = {
+    "office": 13,
+    "school": 14,
+    "home": 15,
+    "airport": 16
+}
+
+# 목적지 도착 판단을 위한 임계값
+DESTINATION_ARRIVAL_THRESHOLD = 3000 # 5만 픽셀
+
+# 목적지 추적을 위한 설정
+DESTINATION_TRACKING_CONFIDENCE = 0.5
+DESTINATION_MIN_AREA = 3000
+
 # ROI 슬라이스 계산 함수
 def get_roi_slice(img_height):
     """

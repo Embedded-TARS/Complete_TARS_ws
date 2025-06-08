@@ -64,21 +64,29 @@ def clear_screen():
     """화면을 깨끗하게 클리어"""
     print("\033[H\033[2J", end="", flush=True)
 
-def print_status_clean(status_lines):
-    """상태를 깨끗하게 출력"""
-    # 커서를 맨 위로 이동하고 화면 클리어
-    print("\033[H", end="")
+def print_status_clean(status, frame):
+    """상태 정보를 깔끔하게 출력"""
+    # 텍스트 크기를 줄이고 위치 조정
+    font_scale = 0.4  # 더 작은 폰트 크기
+    thickness = 1
+    line_spacing = 15  # 줄 간격 줄임
+    margin = 5  # 여백
     
-    # 각 줄을 출력하고 줄 끝까지 클리어
-    for line in status_lines:
-        print(f"{line}\033[K")  # \033[K는 커서부터 줄 끝까지 클리어
+    # 상태 정보를 오른쪽 상단에 표시
+    for i, line in enumerate(status):
+        y_pos = margin + (i * line_spacing)  # 각 줄의 y 위치
+        # 텍스트 배경을 위한 사각형 그리기
+        (text_width, text_height), baseline = cv2.getTextSize(line, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
+        cv2.rectangle(frame, 
+                     (frame.shape[1] - text_width - margin, y_pos - text_height - baseline - 2),
+                     (frame.shape[1] - margin, y_pos),
+                     (0, 0, 0), -1)  # 검은색 배경
+        # 텍스트 그리기
+        cv2.putText(frame, line, 
+                   (frame.shape[1] - text_width - margin, y_pos - baseline - 2),
+                   cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), thickness)
     
-    # 추가 빈 줄들도 클리어 (이전 출력이 더 길었을 경우를 대비)
-    for _ in range(5):
-        print("\033[K")
-    
-    # 커서를 다시 상태 출력 아래로 이동
-    print(f"\033[{len(status_lines)+1}H", end="", flush=True)
+    return frame
 
 class CommandHandler:
     def __init__(self, host='0.0.0.0', port=5000):
@@ -154,20 +162,11 @@ def main(display_mode=True, use_llm=False):
     # 자율주행 모듈 및 카메라 초기화
     lane_model = LaneDetectionModel(model_path="lane.pt", lane_class_id=12)
     perception = LanePerception(lane_width_px=LANE_WIDTH_PX, ema_alpha=EMA_ALPHA)
-    planner = EnhancedLanePlanner(model_path="obj.pt")
+    planner = EnhancedLanePlanner(model_path="obj.pt", destination_model_path="destination.pt")
     controller = RobotController(base)
     camera_manager = CameraManager.get_instance()
     camera_manager.initialize_camera(width=CAMERA_WIDTH, height=CAMERA_HEIGHT, capture_fps=CAMERA_FPS)
 
-    # LLM 모드일 경우 추가 초기화
-    if use_llm:
-        try:
-            from tars_llm import LLMController
-            llm_controller = LLMController()
-            print("🤖 LLM 컨트롤러 초기화 완료")
-        except ImportError:
-            print("❌ LLM 모듈을 찾을 수 없습니다. 기본 모드로 전환합니다.")
-            use_llm = False
 
     print("🚗 자율주행 모드 시작 - q 키를 눌러 종료, 스페이스바로 일시정지/재시작")
     if use_llm:
@@ -188,6 +187,12 @@ def main(display_mode=True, use_llm=False):
             
             if use_llm and current_command is None:
                 # LLM 모드에서 명령이 없으면 대기
+                frame = camera_manager.get_frame()  # 프레임을 먼저 가져옵니다
+                if frame is None:
+                    print("❌ 프레임 수신 실패")
+                    time.sleep(0.1)
+                    continue
+                    
                 status = [
                     "=== 자율주행 상태 ===",
                     "상태: 명령 대기 중...",
@@ -199,7 +204,7 @@ def main(display_mode=True, use_llm=False):
                 ]
                 if use_llm:
                     status.append("모드: LLM 기반 자율주행")
-                print_status_clean(status)
+                print_status_clean(status, frame)
                 
                 if is_key_pressed():
                     key = get_key()
@@ -215,6 +220,10 @@ def main(display_mode=True, use_llm=False):
                 time.sleep(0.1)
                 continue
 
+            # 프레임 디버깅 정보 추가
+            print(f"프레임 크기: {frame.shape if frame is not None else 'None'}")
+            
+        
             img_center_x = (frame.shape[1] // 2)
             roi = get_roi_slice(frame.shape[0]) 
 
@@ -223,7 +232,7 @@ def main(display_mode=True, use_llm=False):
 
             if use_llm:
                 # LLM 기반 제어
-                linear_speed, steering, deviation, state, detected_objects = llm_controller.plan(
+                linear_speed, steering, deviation, state, detected_objects = planner.plan_with_objects(
                     frame, lane_center_x, img_center_x, current_command
                 )
             else:
@@ -237,6 +246,10 @@ def main(display_mode=True, use_llm=False):
                     state = "no_lane_detected"
                     detected_objects = []
 
+            # 디버깅 정보 추가
+            print(f"감지된 객체 수: {len(detected_objects)}")
+            print(f"현재 상태: {state}")
+
             status = [
                 "=== 자율주행 상태 ===",
                 f"상태: {state}",
@@ -247,9 +260,6 @@ def main(display_mode=True, use_llm=False):
             
             if use_llm:
                 status.append("모드: LLM 기반 자율주행")
-                if hasattr(llm_controller, 'get_current_plan'):
-                    plan_info = llm_controller.get_current_plan()
-                    status.append(f"LLM 계획: {plan_info}")
                 if current_command:
                     status.append(f"현재 명령: {current_command}")
             
@@ -266,6 +276,10 @@ def main(display_mode=True, use_llm=False):
                 else:
                     direction = "직진"
                 status.append(f"진행 방향: {direction} (조향각: {steering:.2f} rad)")
+                
+                # 목적지 도착 상태 표시
+                if state == "destination_arrived":
+                    status.append("🎯 목적지 도착!")
             
             if detected_objects:
                 status.append(f"객체: {len(detected_objects)}개")
@@ -273,7 +287,8 @@ def main(display_mode=True, use_llm=False):
                     if obj['confidence'] > 0.5:
                         status.append(f"- {CLASS_INFO[obj['class']]['name']} ({obj['confidence']:.0%})")
             
-            print_status_clean(status)
+            # 상태 정보를 프레임에 표시
+            frame = print_status_clean(status, frame)
 
             if not is_paused:
                 controller.send_control(linear_speed, steering)
@@ -281,13 +296,36 @@ def main(display_mode=True, use_llm=False):
                 controller.send_control(0, 0)
 
             if display_mode:
-                frame_with_lanes = perception.visualize_lanes(frame, deviation, steering, roi)
-                frame_with_objects = planner.visualize_detections(frame_with_lanes, detected_objects)
-                
-                if is_paused:
-                    cv2.putText(frame_with_objects, "PAUSED", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-                elif use_llm:
-                    cv2.putText(frame_with_objects, "LLM MODE", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                try:
+                    frame_with_lanes = perception.visualize_lanes(frame, deviation, steering, roi)
+                    if frame_with_lanes is None:
+                        print("❌ 차선 시각화 실패")
+                        continue
+                        
+                    frame_with_objects = planner.visualize_detections(frame_with_lanes, detected_objects)
+                    if frame_with_objects is None:
+                        print("❌ 객체 시각화 실패")
+                        continue
+                    
+                    # 상태 정보를 프레임에 표시
+                    frame_with_objects = print_status_clean(status, frame_with_objects)
+                    
+                    if is_paused:
+                        cv2.putText(frame_with_objects, "PAUSED", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+                    elif use_llm:
+                        cv2.putText(frame_with_objects, "LLM MODE", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                        # 현재 명령이 있는 경우 화면에 표시
+                        if current_command:
+                            command_text = f"Command: {current_command.get('task_type', '')} - {current_command.get('action', '')}"
+                            if 'parameters' in current_command:
+                                params = current_command['parameters']
+                                if 'destination' in params:
+                                    command_text += f" to {params['destination']}"
+                            cv2.putText(frame_with_objects, command_text, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
+                    cv2.imshow("TARS Autonomous Driving", frame_with_objects)
+                except Exception as e:
+                    print(f"프레임 시각화 중 오류: {e}")
 
             if is_key_pressed():
                 key = get_key()
@@ -310,9 +348,24 @@ def main(display_mode=True, use_llm=False):
                     print(f"\n{'⏸️  일시정지 상태' if is_paused else '▶️  주행 재시작'}")
 
             # 목적지 도착 확인 로직 (LLM 모드일 때만)
-            if use_llm and current_command and current_command.get('destination_reached', False):
+            if use_llm and current_command and state == "destination_arrived":
                 print("목적지에 도착했습니다. 다음 명령을 기다립니다...")
                 command_handler.clear_current_command()
+                # 목적지 도착 후 대기 상태로 전환
+                status = [
+                    "=== 자율주행 상태 ===",
+                    "상태: 목적지 도착",
+                    "속도: 0.00 m/s",
+                    "조향: 0.00 rad/s",
+                    "주행: 대기",
+                    "현재 명령: 없음",
+                    "🎯 목적지 도착! 다음 JSON 명령을 기다리는 중... (종료하려면 'q' 키를 누르세요)"
+                ]
+                if use_llm:
+                    status.append("모드: LLM 기반 자율주행")
+                print_status_clean(status, frame)
+                time.sleep(0.1)
+                continue
 
     except KeyboardInterrupt:
         print("\n\n자율주행 모드가 Ctrl+C로 중단되었습니다.")
@@ -375,7 +428,7 @@ def main_menu():
             if result == 'menu':
                 continue
         elif mode == 'al':
-            result = main(display_mode=True, use_llm=True)  # LLM 기반 자율주행 모드 실행
+            result = main(display_mode=False, use_llm=True)  # LLM 기반 자율주행 모드 실행
             if result == 'menu':
                 continue
         elif mode == 'mp':
