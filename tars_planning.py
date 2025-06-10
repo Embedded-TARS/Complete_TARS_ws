@@ -2,7 +2,6 @@
 
 import numpy as np
 import time
-import torch
 from ultralytics import YOLO
 from tars_config import (
     MAX_STEER, MAX_SPEED, MIN_SPEED, STRAIGHT_SPEED, TURN_THRESHOLD,
@@ -29,7 +28,8 @@ CLASS_INFO = {
     13: {"name": "office", "color": (255, 128, 0)},  # 주황색
     14: {"name": "school", "color": (128, 0, 255)},  # 보라색
     15: {"name": "home", "color": (0, 255, 128)},    # 연두색
-    16: {"name": "airport", "color": (255, 0, 128)}  # 분홍색
+    16: {"name": "airport", "color": (255, 0, 128)},  # 분홍색
+    17: {"name": "passenger", "color": (255, 255, 255)},
 }
 
 class EnhancedLanePlanner:
@@ -38,7 +38,7 @@ class EnhancedLanePlanner:
         self.MAX_SPEED = MAX_SPEED
         self.MIN_SPEED = MIN_SPEED
         self.STRAIGHT_SPEED = STRAIGHT_SPEED
-        self.TURN_THRESHOLD = TURN_THRESHOLD
+        self.TURN_THRESHOLD = 0.04  # 0.15에서 0.08로 감소
         
         # 차선 관련 상수 추가
         self.LANE_WIDTH_PX = 640  # 기본 차선 폭 (픽셀)
@@ -47,7 +47,7 @@ class EnhancedLanePlanner:
         self.WHEELBASE = 0.1  # 기존보다 작게 설정
         self.LOOKAHEAD_DISTANCE = 0.3  # 기존보다 작게 설정
         
-        self.device = 0 if torch.cuda.is_available() else "cpu"
+        self.device = 0
         self.sign_model = YOLO(model_path).to(self.device)
         self.destination_model = YOLO(destination_model_path).to(self.device)
         self.vehicle_classes = [5, 6, 7]  # car, bus, motorcycle
@@ -89,9 +89,13 @@ class EnhancedLanePlanner:
         self.current_state = "lane_following"
         self.state_start_time = time.time()
         
+        # 승객 관련 변수 추가
+        self.passenger_detected = False
+        self.PASSENGER_DETECTION_THRESHOLD = 10000  # 승객 감지 면적 임계값
+        
         # Pure Pursuit 조향 게인 - 더 민감하게 조정
-        self.STEERING_GAIN = 1.2  # 1.0에서 1.2로 증가
-        self.SPEED_REDUCTION_FACTOR = 0.7  # Factor to reduce speed during turns
+        self.STEERING_GAIN = 0.5  # 1.2에서 1.5로 증가
+        # self.SPEED_REDUCTION_FACTOR = 0.7  # Factor to reduce speed during turns
         
         self.original_lane_center = None
         self.recovery_start_time = None
@@ -104,12 +108,27 @@ class EnhancedLanePlanner:
         self.AVOIDANCE_DURATION_FRAMES = 105
         self.AVOIDANCE_COOLDOWN_FRAMES = 90
         self.last_avoidance_frame = -1000
+
+        self.passenger_objects = []
+        self.destination_objects = []
+        self.detected_objects = []
+        
+        # 주행 관련 변수 추가
+        self.trip_start_time = None
+        self.trip_status = "idle"  # idle, moving, arrived
+        self.base_fare = 3000  # 기본 요금 (원)
+        self.per_second_fare = 100  # 초당 요금 (원) - 100원/분을 초당으로 변환
+        self.trip_info = {
+            "duration": 0,
+            "fare": 0,
+            "distance": 0  # 미터 단위
+        }
         
         print(f"✅ Enhanced Lane Planner initialized with device: {self.device}")
         print(f"📊 Pure Pursuit Parameters: WHEELBASE={self.WHEELBASE}, LOOKAHEAD={self.LOOKAHEAD_DISTANCE}")
 
     def detect_objects(self, frame):
-        det_results = self.sign_model.predict(frame, verbose=False)
+        det_results = self.sign_model.predict(frame, verbose=False, imgsz=320)
         boxes = det_results[0].boxes
         detected_objects = []
         
@@ -160,14 +179,15 @@ class EnhancedLanePlanner:
                         'area': area,
                         'bbox': (x1, y1, x2, y2)
                     })
-        
+            self.detected_objects = detected_objects
         return detected_objects
     
-    def detect_destination(self, frame):
-        """📍 목적지 객체 감지용 모델 실행"""
-        det_results = self.destination_model.predict(frame, verbose=False)
+    def detect_destination_and_passenger(self, frame):
+        """📍 목적지와 승객 객체 감지용 모델 실행"""
+        det_results = self.destination_model.predict(frame, verbose=False, imgsz=320)
         boxes = det_results[0].boxes
         destination_objects = []
+        passenger_objects = []
 
         if boxes is not None:
             for i in range(len(boxes)):
@@ -177,22 +197,30 @@ class EnhancedLanePlanner:
                 x1, y1, x2, y2 = map(int, xyxy)
                 area = (x2 - x1) * (y2 - y1)
 
-                # 목적지 클래스 ID 매핑 (0->13, 1->14, 2->15, 3->16)
+                # 목적지/승객 클래스 ID 매핑 (0->13, 1->14, 2->15, 3->16, 4->17)
                 cls_id = raw_cls_id + 13
                 
                 # 디버깅 정보 출력 (30프레임마다)
-                if self.current_frame_count % 30 == 0:
-                    print(f"목적지 감지: {CLASS_INFO[cls_id]['name']} (신뢰도: {conf:.2f}, 면적: {area})")
+                print(f"목적지/승객 감지: {CLASS_INFO[cls_id]['name']} (신뢰도: {conf:.2f}, 면적: {area})")
 
-                destination_objects.append({
+                obj_info = {
                     'class': cls_id,
                     'confidence': conf,
                     'area': area,
                     'bbox': (x1, y1, x2, y2),
                     'raw_class': raw_cls_id
-                })
+                }
 
-        return destination_objects
+                # 승객인 경우 passenger_objects에 추가
+                if cls_id == 17:  # passenger
+                    passenger_objects.append(obj_info)
+                else:  # 목적지인 경우
+                    destination_objects.append(obj_info)
+
+                self.passenger_objects = passenger_objects
+                self.destination_objects = destination_objects
+
+        return destination_objects, passenger_objects
 
     def process_traffic_light(self, detected_objects):
         class_ids = [obj["class"] for obj in detected_objects]
@@ -225,6 +253,16 @@ class EnhancedLanePlanner:
         
         # 프레임 카운터 증가
         self.current_frame_count += 1
+        
+        # 승객 감지 처리
+        for obj in detected_objects:
+            if obj['class'] == 17:  # passenger 클래스
+                area = obj['area']
+                if area >= self.PASSENGER_DETECTION_THRESHOLD:
+                    if not self.passenger_detected:
+                        print("👥 승객 감지 - 일시정지")
+                        self.passenger_detected = True
+                        return "passenger_detected", (0.0, 0.0)
         
         # 회전 동작 중인 경우
         if self.is_turning:
@@ -392,7 +430,7 @@ class EnhancedLanePlanner:
         return speed, steering, deviation
 
     def process_llm_command(self, llm_output, lane_center_x, image_center_x):
-        """LLM의 JSON 출력을 처리하여 주행 명령을 생성"""
+        """로컬 JSON 파일의 명령을 처리하여 주행 명령을 생성"""
         try:
             # 이미 JSON 객체인 경우 바로 사용
             command = llm_output if isinstance(llm_output, dict) else json.loads(llm_output)
@@ -421,8 +459,6 @@ class EnhancedLanePlanner:
                     if lane_center_x is None:
                         return base_speed, 0.0, 0.0, "no_lane", []
                     speed, steering, deviation = self.calculate_lane_following(lane_center_x, image_center_x, [])
-                    # 속도 제어 적용
-                    speed = min(speed, base_speed)
                     return speed, steering, deviation, action, []
                 elif action == "go_backward":
                     return -base_speed, 0.0, 0.0, action, []  # 후진 속도, 조향 0
@@ -448,12 +484,12 @@ class EnhancedLanePlanner:
                     print(f"🎯 새로운 목적지 설정: {destination}")
                     self.current_destination = destination
                     self.destination_arrived = False
+                    self.trip_status = "moving"
+                    self.trip_start_time = time.time()
                     # 목적지 설정만 하고, 주행은 차선 추종만 하다가 목적지가 보이면 정지
                     if lane_center_x is None:
                         return base_speed, 0.0, 0.0, "no_lane", []
                     speed, steering, deviation = self.calculate_lane_following(lane_center_x, image_center_x, [])
-                    # 속도 제어 적용
-                    # speed = min(speed, base_speed)
                     return speed, steering, deviation, "navigating", []
             
             # 알 수 없는 명령이나 task_type이 unknown인 경우
@@ -461,12 +497,10 @@ class EnhancedLanePlanner:
             if lane_center_x is None:
                 return base_speed, 0.0, 0.0, "no_lane", []
             speed, steering, deviation = self.calculate_lane_following(lane_center_x, image_center_x, [])
-            # 속도 제어 적용
-            # speed = min(speed, base_speed)
             return speed, steering, deviation, "lane_following", []
             
         except Exception as e:
-            print(f"LLM 명령 처리 중 오류 발생: {e}")
+            print(f"명령 처리 중 오류 발생: {e}")
             # 오류 발생 시 기본 차선 추종으로 대체
             if lane_center_x is None:
                 return self.STRAIGHT_SPEED, 0.0, 0.0, "no_lane", []
@@ -496,20 +530,46 @@ class EnhancedLanePlanner:
                 area = obj['area']
                 conf = obj['confidence']
                 
-                if self.current_frame_count % 30 == 0:
-                    print(f"목적지 감지 중: {self.current_destination} (면적: {area}, 신뢰도: {conf:.2f})")
+                print(f"목적지 감지 중: {self.current_destination} (면적: {area}, 신뢰도: {conf:.2f})")
                 
                 if area >= self.DESTINATION_ARRIVAL_THRESHOLD and conf > 0.5:
                     print(f"🎯 목적지 도착 감지: {self.current_destination}")
                     self.destination_arrived = True
+                    
+                    # 주행 정보 계산
+                    if self.trip_start_time is not None:
+                        trip_duration = time.time() - self.trip_start_time
+                        fare = self.base_fare + (trip_duration * self.per_second_fare)  # 초당 요금 적용
+                        
+                        self.trip_info = {
+                            "duration": round(trip_duration, 2),
+                            "fare": round(fare, 2),
+                            "distance": round(trip_duration * self.STRAIGHT_SPEED, 2)  # 대략적인 거리 계산
+                        }
+                        
+                        print(f"📊 주행 정보:")
+                        print(f"   - 주행 시간: {self.trip_info['duration']}초")
+                        print(f"   - 요금: {self.trip_info['fare']}원")
+                        print(f"   - 주행 거리: {self.trip_info['distance']}m")
+                    
                     self.current_destination = None
+                    self.trip_start_time = None
+                    self.trip_status = "idle"
                     return True
         return False
 
     def plan_with_objects(self, frame, lane_center_x, image_center_x, current_command=None):
         """객체 인식을 포함한 전체 계획 수립 + LLM 주행 중에도 감지 상황 반영"""
-        detected_objects = self.detect_objects(frame)
-        destination_objects = self.detect_destination(frame)
+        # 프레임 디버깅 정보 출력
+        # print(f"\n📊 프레임 정보:")
+        # print(f"   - 프레임 크기: {frame.shape}")
+        # # print(f"   - 차선 중심점: {lane_center_x}")
+        # # print(f"   - 이미지 중심점: {image_center_x}")
+        # print(f"   - 현재 프레임 카운트: {self.current_frame_count}")
+        
+        
+        detected_objects = self.detected_objects
+        destination_objects, passenger_objects = self.destination_objects, self.passenger_objects
 
         # ✅ 목적지 도착 여부 확인
         if self.current_destination and not self.destination_arrived:
@@ -525,10 +585,25 @@ class EnhancedLanePlanner:
                 self.current_state = "destination_arrived"
                 return 0.0, 0.0, 0.0, "destination_arrived", detected_objects
 
+        # 승객 감지 처리
+        for passenger in passenger_objects:
+            if passenger['area'] >= self.PASSENGER_DETECTION_THRESHOLD:
+                if not self.passenger_detected:
+                    print("👥 승객 감지 - 일시정지")
+                    self.passenger_detected = True
+                    return 0.0, 0.0, 0.0, "passenger_detected", detected_objects
+
+        # 기본 차선 추종 계산 - 한 번만 계산
+        if lane_center_x is not None:
+            base_speed, base_steering, base_deviation = self.calculate_lane_following(lane_center_x, image_center_x, detected_objects)
+        else:
+            base_speed, base_steering, base_deviation = self.STRAIGHT_SPEED, 0.0, 0.0
+
         # ✅ LLM 명령 우선 처리
         if current_command:
-            # LLM이 계획한 기본 주행 명령
-            speed, steering, deviation, state, _ = self.process_llm_command(current_command, lane_center_x, image_center_x)
+            # process_llm_command를 통해 목적지 설정 및 기본 주행 명령 처리
+            speed, steering, deviation, action, _ = self.process_llm_command(current_command, lane_center_x, image_center_x)
+            
             # 🚦 신호등 감지 우선
             traffic_result, traffic_control = self.process_traffic_light(detected_objects)
             if traffic_result == "stop":
@@ -550,7 +625,7 @@ class EnhancedLanePlanner:
                 return s, st if st is not None else steering, deviation, sign_result, detected_objects
 
             # 기본적으로 LLM 계획대로 실행
-            return speed, steering, deviation, state, detected_objects
+            return speed, steering, deviation, action, detected_objects
 
         # ✅ 일반 주행 모드
         # 1. 신호등 처리
@@ -587,6 +662,12 @@ class EnhancedLanePlanner:
             "last_action_time": self.last_action_time,
             "current_state": self.current_state
         }
+
+    def get_trip_info(self):
+        """목적지 도착 후의 주행 정보 반환"""
+        if self.trip_status == "idle" and self.trip_info["duration"] > 0:
+            return self.trip_info
+        return None
 
     def plan(self, lane_center_x, image_center_x, frame=None, llm_output=None):
         """메인 계획 함수"""
@@ -653,4 +734,3 @@ class EnhancedLanePlanner:
                                font, 0.7, (0, 255, 0), 2)
         
         return vis_frame
-

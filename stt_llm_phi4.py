@@ -4,14 +4,25 @@ import numpy as np
 import whisper
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
-from accelerate import init_empty_weights, load_checkpoint_in_model, disk_offload
-from tars_planning import EnhancedLanePlanner  # Your custom module
+from gtts import gTTS
+import os
+import json
+import requests
+import re
+import socket
+from tars_planning import EnhancedLanePlanner
+import asyncio
+import websockets
+import time
+from datetime import datetime
 
-# Recording settings
 SAMPLE_RATE = 16000
 CHANNELS = 1
 OUTPUT_FILE = "recorded_audio.wav"
 recording = []
+
+# EnhancedLanePlanner 인스턴스 생성
+planner = EnhancedLanePlanner()
 
 def audio_callback(indata, frames, time_info, status):
     recording.append(indata.copy())
@@ -19,48 +30,32 @@ def audio_callback(indata, frames, time_info, status):
 def record_audio():
     global recording
     recording = []
-    print("녹음 시작... [Enter]로 종료")
     with sd.InputStream(samplerate=SAMPLE_RATE, channels=CHANNELS, callback=audio_callback):
         input()
+
     audio_data = np.concatenate(recording, axis=0)
     wav.write(OUTPUT_FILE, SAMPLE_RATE, audio_data)
-    print("녹음 완료.")
 
 def transcribe_audio():
-    model = whisper.load_model("tiny.en")  # or "base", "small"
+    model = whisper.load_model("tiny.en")
     result = model.transcribe(OUTPUT_FILE)
     return result["text"]
 
-# Load tokenizer
+torch.manual_seed(0)
 model_path = "microsoft/Phi-4-mini-instruct"
-tokenizer = AutoTokenizer.from_pretrained(model_path)
-
-# Load model with disk_offload
-with init_empty_weights():
-    model = AutoModelForCausalLM.from_pretrained(model_path)
-
-device_map = {"": "cpu"}
-offload_folder = "offload"
-
-model = load_checkpoint_in_model(
-    model,
-    checkpoint=model_path,
-    device_map=device_map,
-    offload_folder=offload_folder,
-    offload_state_dict=True
+model = AutoModelForCausalLM.from_pretrained(
+    model_path,
+    device_map="auto",
+    torch_dtype="auto",
+    trust_remote_code=True,
 )
-
-# Create pipeline
+tokenizer = AutoTokenizer.from_pretrained(model_path)
 pipe = pipeline(
     "text-generation",
     model=model,
     tokenizer=tokenizer,
 )
 
-# EnhancedLanePlanner 인스턴스 생성
-planner = EnhancedLanePlanner()
-
-# Instruction template
 messages = [
     {
         "role": "system",
@@ -70,13 +65,21 @@ messages = [
             "There are only two types of tasks:\n"
             "1. `navigate`: Go to a specific destination with a speed setting.\n"
             "   - Valid destinations: 'home', 'office', 'airport', 'school'\n"
-            "   - Valid speeds: 'fast', 'normal'(default), 'slow')\n\n"
+            "   - Valid speeds: 'fast', 'normal' (default), 'slow'\n\n"
             "2. `manual_command`: Direct movement commands.\n"
-            "   - Valid commands: 'stop', 'forward', 'backward', 'left_turn', 'right_turn', 'turn_around'\n\n"
+            "   - Valid commands (mapped to action field):\n"
+            "     - 'stop' → 'stop'\n"
+            "     - 'forward' → 'go_forward'\n"
+            "     - 'backward' → 'go_backward'\n"
+            "     - 'left_turn' → 'turn_left'\n"
+            "     - 'right_turn' → 'turn_right'\n"
+            "     - 'turn_around' → 'turn_around'\n\n"
             "If the user's command is unclear or doesn't match any category, reply politely asking for clarification.\n\n"
-            "Always respond with:\n"
-            "1. A short assistant-style reply in English.\n"
-            "2. A JSON output in this format:\n"
+            "When receiving trip information, respond with a natural summary of the trip details in English.\n"
+            "For example: 'Trip completed! We traveled {distance} meters in {duration} seconds. The fare is {fare} won.'\n\n"
+            "You must always respond with:\n"
+            "1. A short assistant-style reply in English (e.g., 'Okay, going to school at normal speed.')\n"
+            "2. A JSON block enclosed in triple backticks, like this:\n"
             "```\n"
             "{\n"
             '  "task_type": "navigate" | "manual_command" | "unknown",\n'
@@ -84,9 +87,10 @@ messages = [
             '  "parameters": {\n'
             '     "destination": "home" | "office" | "airport" | "school" | null,\n'
             '     "speed": "fast" | "normal" | "slow" | null\n'
-            "  }\n"
+            '  }\n'
             "}\n"
-            "Only use the above values. If the user says something unclear like 'go anywhere', then ask for clarification and set task_type to 'unknown'."
+            "```\n"
+            "Only use the values listed above. If the input is unclear (e.g., 'go anywhere'), then return 'task_type': 'unknown', and ask the user to clarify."
         )
     }
 ]
@@ -94,28 +98,83 @@ messages = [
 generation_args = {
     "max_new_tokens": 128,
     "return_full_text": False,
+    #"temperature": 0.7,
     "do_sample": False,
 }
 
-# Main loop
 print("[Enter] 키를 눌러 녹음을 시작/종료하세요.")
-while True:
-    user_input = input("[Enter]로 녹음 / 'exit' 입력시 종료: ").strip().lower()
-    if user_input == "exit":
-        print("대화를 종료합니다.")
-        break
 
-    record_audio()
-    stt_text = transcribe_audio()
-    print(f"You (STT): {stt_text}")
+# 서버에 연결
+SERVER_IP = "192.168.0.43"  # TCP 서버 IP
+PORT = 5000
 
-    messages.append({"role": "user", "content": stt_text})
-    output = pipe(messages, **generation_args)
-    reply = output[0]["generated_text"].strip()
-    print(f"TARS: {reply}")
+class STTLLMHandler:
+    def __init__(self, host='localhost', port=5001):
+        self.host = host
+        self.port = port
+        self.server = None
+        self.clients = set()
+        self.is_running = False
 
-    # LLM의 출력에서 JSON을 전달하여 계획 계산
-    speed, steering, deviation = planner.plan(None, None, None, reply)
-    print(f"[Planning 결과] 속도: {speed}, 조향: {steering}, 편차: {deviation}")
+    async def start_server(self):
+        try:
+            self.server = await websockets.serve(self._handle_client, self.host, self.port)
+            self.is_running = True
+            print(f"STT LLM 서버가 시작되었습니다. 포트: {self.port}")
+        except Exception as e:
+            print(f"서버 시작 중 오류 발생: {e}")
+            raise
 
-    messages.append({"role": "assistant", "content": reply})
+    async def _handle_client(self, websocket, path):
+        self.clients.add(websocket)
+        try:
+            async for message in websocket:
+                try:
+                    data = json.loads(message)
+                    # STT 처리 및 LLM 응답 생성
+                    response = await self.process_stt_command(data)
+                    await websocket.send(json.dumps(response))
+                except json.JSONDecodeError:
+                    print("잘못된 JSON 형식")
+        except websockets.exceptions.ConnectionClosed:
+            print("클라이언트 연결 종료")
+        finally:
+            self.clients.remove(websocket)
+
+    async def process_stt_command(self, data):
+        # STT 명령 처리 로직
+        try:
+            # 여기에 STT 처리 및 LLM 응답 생성 로직 구현
+            response = {
+                "status": "success",
+                "action": "process_command",
+                "parameters": data.get("parameters", {})
+            }
+            return response
+        except Exception as e:
+            print(f"명령 처리 중 오류: {e}")
+            return {"status": "error", "message": str(e)}
+
+    async def stop_server(self):
+        print("서버 종료 중...")
+        self.is_running = False
+        if self.server:
+            self.server.close()
+            await self.server.wait_closed()
+        print("서버가 종료되었습니다.")
+
+async def main():
+    stt_llm_handler = STTLLMHandler()
+    await stt_llm_handler.start_server()
+    
+    try:
+        # 서버가 실행 중인 동안 대기
+        while stt_llm_handler.is_running:
+            await asyncio.sleep(1)
+    except KeyboardInterrupt:
+        print("\n서버를 종료합니다...")
+    finally:
+        await stt_llm_handler.stop_server()
+
+if __name__ == "__main__":
+    asyncio.run(main())

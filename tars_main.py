@@ -13,7 +13,7 @@ from base_ctrl_js import BaseController
 import cv2
 import glob
 import time
-import sys
+import sys, os
 import pygame
 from tars_manual_ctrl import PygameKeyboardController
 from tars_manual_ctrl import TerminalKeyboardController
@@ -97,16 +97,62 @@ class CommandHandler:
         self.command_lock = threading.Lock()
         self.is_running = False
         self.server_thread = None
+        self.planner = EnhancedLanePlanner()  # planner 인스턴스 생성
 
     def start_server(self):
-        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.server_socket.bind((self.host, self.port))
-        self.server_socket.listen(1)
-        self.is_running = True
-        self.server_thread = threading.Thread(target=self._listen_for_commands)
-        self.server_thread.daemon = True
-        self.server_thread.start()
-        print(f"명령 서버가 시작되었습니다. 포트: {self.port}")
+        try:
+            self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            # 소켓 재사용 옵션 추가
+            self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.server_socket.bind((self.host, self.port))
+            self.server_socket.listen(1)
+            self.is_running = True
+            self.server_thread = threading.Thread(target=self._listen_for_commands)
+            self.server_thread.daemon = True
+            self.server_thread.start()
+            print(f"명령 서버가 시작되었습니다. 포트: {self.port}")
+        except Exception as e:
+            print(f"서버 시작 중 오류 발생: {e}")
+            if self.server_socket:
+                self.server_socket.close()
+            raise
+
+    def _listen_for_commands(self):
+        while self.is_running:
+            try:
+                client_socket, addr = self.server_socket.accept()
+                print(f"클라이언트 연결됨: {addr}")
+                data = client_socket.recv(1024).decode('utf-8')
+                try:
+                    command = json.loads(data)
+                    with self.command_lock:
+                        self.current_command = command
+                    print(f"새로운 명령 수신: {command}")
+
+                    # 목적지 도착 후의 trip info 가져오기
+                    trip_info = self.planner.get_trip_info()  # self.planner 사용
+                    if trip_info:  # trip_info가 None이 아닐 때만 전송
+                        # trip info를 포함한 응답 생성
+                        response = {
+                            "trip_info": trip_info
+                        }
+                        # 클라이언트에게 trip info 전송
+                        client_socket.send(json.dumps(response).encode())
+                        print(f"✅ Trip info sent to client: {trip_info}")
+
+                except json.JSONDecodeError:
+                    print("잘못된 JSON 형식")
+                client_socket.close()
+            except Exception as e:
+                print(f"명령 수신 중 오류: {e}")
+
+    def get_current_command(self):
+        with self.command_lock:
+            return self.current_command
+
+    def clear_current_command(self):
+        with self.command_lock:
+            self.current_command = None
 
     def stop_server(self):
         print("서버 종료 중...")
@@ -129,31 +175,6 @@ class CommandHandler:
         
         print("서버가 종료되었습니다.")
 
-    def _listen_for_commands(self):
-        while self.is_running:
-            try:
-                client_socket, addr = self.server_socket.accept()
-                print(f"클라이언트 연결됨: {addr}")
-                data = client_socket.recv(1024).decode('utf-8')
-                try:
-                    command = json.loads(data)
-                    with self.command_lock:
-                        self.current_command = command
-                    print(f"새로운 명령 수신: {command}")
-                except json.JSONDecodeError:
-                    print("잘못된 JSON 형식")
-                client_socket.close()
-            except Exception as e:
-                print(f"명령 수신 중 오류: {e}")
-
-    def get_current_command(self):
-        with self.command_lock:
-            return self.current_command
-
-    def clear_current_command(self):
-        with self.command_lock:
-            self.current_command = None
-
 def main(display_mode=True, use_llm=False):
     # 명령 핸들러 초기화 및 시작
     command_handler = CommandHandler()
@@ -167,6 +188,11 @@ def main(display_mode=True, use_llm=False):
     camera_manager = CameraManager.get_instance()
     camera_manager.initialize_camera(width=CAMERA_WIDTH, height=CAMERA_HEIGHT, capture_fps=CAMERA_FPS)
 
+    # 주행 상태 변수
+    current_command = None
+    state = "normal"
+    last_command_time = time.time()
+    command_timeout = 30  # 30초 타임아웃
 
     print("🚗 자율주행 모드 시작 - q 키를 눌러 종료, 스페이스바로 일시정지/재시작")
     if use_llm:
@@ -185,25 +211,55 @@ def main(display_mode=True, use_llm=False):
             # 현재 명령 확인
             current_command = command_handler.get_current_command()
             
-            if use_llm and current_command is None:
-                # LLM 모드에서 명령이 없으면 대기
-                frame = camera_manager.get_frame()  # 프레임을 먼저 가져옵니다
-                if frame is None:
-                    print("❌ 프레임 수신 실패")
-                    time.sleep(0.1)
-                    continue
-                    
+            frame = camera_manager.get_frame()
+            if frame is None:
+                print("❌ 프레임 수신 실패")
+                time.sleep(0.1)
+                continue
+
+            # 프레임 디버깅 정보 추가
+            # print(f"프레임 크기: {frame.shape if frame is not None else 'None'}")
+            
+            img_center_x = (frame.shape[1] // 2)
+            roi = get_roi_slice(frame.shape[0]) 
+
+            results = lane_model.predict(frame)
+            lane_center_x = perception.update(results[0], roi=roi)
+
+            # 승객 감지 확인
+            detected_objects = planner.detect_objects(frame)
+            destination_objects, passenger_objects = planner.detect_destination_and_passenger(frame)
+
+            if passenger_objects and passenger_objects[0]['area'] >= 10000 and not use_llm:
+                # 승객이 감지되면 LLM 모드로 전환
+                print("👥 승객 감지 - LLM 명령 대기 중")
+                use_llm = True
+                current_command = None
                 status = [
                     "=== 자율주행 상태 ===",
-                    "상태: 명령 대기 중...",
+                    "상태: 승객 감지",
                     "속도: 0.00 m/s",
                     "조향: 0.00 rad/s",
                     "주행: 대기",
                     "현재 명령: 없음",
-                    "JSON 명령을 기다리는 중... (종료하려면 'q' 키를 누르세요)"
+                    "승객 탑승을 위한 JSON 명령을 기다리는 중... (종료하려면 'q' 키를 누르세요)"
                 ]
-                if use_llm:
-                    status.append("모드: LLM 기반 자율주행")
+                print_status_clean(status, frame)
+                controller.send_control(0, 0)  # 정지
+                time.sleep(0.1)
+                continue
+
+            # LLM 모드에서 명령이 없으면 대기 (승객 감지 후에만)
+            if use_llm and current_command is None:
+                status = [
+                    "=== 자율주행 상태 ===",
+                    "상태: 승객 감지",
+                    "속도: 0.00 m/s",
+                    "조향: 0.00 rad/s",
+                    "주행: 대기",
+                    "현재 명령: 없음",
+                    "승객 탑승을 위한 JSON 명령을 기다리는 중... (종료하려면 'q' 키를 누르세요)"
+                ]
                 print_status_clean(status, frame)
                 
                 if is_key_pressed():
@@ -214,31 +270,20 @@ def main(display_mode=True, use_llm=False):
                 time.sleep(0.1)
                 continue
 
-            frame = camera_manager.get_frame()
-            if frame is None:
-                print("❌ 프레임 수신 실패")
-                time.sleep(0.1)
-                continue
-
-            # 프레임 디버깅 정보 추가
-            print(f"프레임 크기: {frame.shape if frame is not None else 'None'}")
-            
-        
-            img_center_x = (frame.shape[1] // 2)
-            roi = get_roi_slice(frame.shape[0]) 
-
-            results = lane_model.predict(frame)
-            lane_center_x = perception.update(results[0], roi=roi)
-
             if use_llm:
                 # LLM 기반 제어
                 linear_speed, steering, deviation, state, detected_objects = planner.plan_with_objects(
                     frame, lane_center_x, img_center_x, current_command
                 )
+                
             else:
+                
                 # 기존 차선 추적 기반 제어
                 if lane_center_x is not None:
+                    start_time = time.time()
                     linear_speed, steering, deviation, state, detected_objects = planner.plan_with_objects(frame, lane_center_x, img_center_x)
+                    end_time = time.time()
+                    os.write(sys.stdout.fileno(), f"time: {(end_time - start_time)*1000:.2f}ms\n".encode())
                 else:
                     linear_speed = 0.3
                     steering = 0.0
@@ -281,9 +326,17 @@ def main(display_mode=True, use_llm=False):
                 if state == "destination_arrived":
                     status.append("🎯 목적지 도착!")
             
+            # 객체 감지 정보 표시 (일반 객체 + 목적지/승객)
             if detected_objects:
                 status.append(f"객체: {len(detected_objects)}개")
                 for obj in detected_objects:
+                    if obj['confidence'] > 0.5:
+                        status.append(f"- {CLASS_INFO[obj['class']]['name']} ({obj['confidence']:.0%})")
+            
+            # 목적지/승객 정보 표시
+            if destination_objects:
+                status.append(f"목적지/승객: {len(destination_objects)}개")
+                for obj in destination_objects:
                     if obj['confidence'] > 0.5:
                         status.append(f"- {CLASS_INFO[obj['class']]['name']} ({obj['confidence']:.0%})")
             
@@ -302,26 +355,33 @@ def main(display_mode=True, use_llm=False):
                         print("❌ 차선 시각화 실패")
                         continue
                         
+                    # 일반 객체와 목적지/승객 객체 모두 시각화
                     frame_with_objects = planner.visualize_detections(frame_with_lanes, detected_objects)
                     if frame_with_objects is None:
                         print("❌ 객체 시각화 실패")
                         continue
                     
-                    # 상태 정보를 프레임에 표시
-                    frame_with_objects = print_status_clean(status, frame_with_objects)
+                    # 목적지/승객 객체 시각화
+                    frame_with_objects = planner.visualize_detections(frame_with_objects, destination_objects)
+                    if frame_with_objects is None:
+                        print("❌ 목적지/승객 시각화 실패")
+                        continue
                     
-                    if is_paused:
-                        cv2.putText(frame_with_objects, "PAUSED", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-                    elif use_llm:
-                        cv2.putText(frame_with_objects, "LLM MODE", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-                        # 현재 명령이 있는 경우 화면에 표시
-                        if current_command:
-                            command_text = f"Command: {current_command.get('task_type', '')} - {current_command.get('action', '')}"
-                            if 'parameters' in current_command:
-                                params = current_command['parameters']
-                                if 'destination' in params:
-                                    command_text += f" to {params['destination']}"
-                            cv2.putText(frame_with_objects, command_text, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                    # 상태 정보를 프레임에 표시
+                    frame_with_objects = print_status_clean(frame_with_objects)
+                    
+                    # if is_paused:
+                    #     cv2.putText(frame_with_objects, "PAUSED", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+                    # elif use_llm:
+                    #     cv2.putText(frame_with_objects, "LLM MODE", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                    #     # 현재 명령이 있는 경우 프레임에 표시
+                    #     if current_command:
+                    #         command_text = f"Command: {current_command.get('task_type', '')} - {current_command.get('action', '')}"
+                    #         if 'parameters' in current_command:
+                    #             params = current_command['parameters']
+                    #             if 'destination' in params:
+                    #                 command_text += f" to {params['destination']}"
+                    #         cv2.putText(frame_with_objects, command_text, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
                     cv2.imshow("TARS Autonomous Driving", frame_with_objects)
                 except Exception as e:

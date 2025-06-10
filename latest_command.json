@@ -1,0 +1,8 @@
+{
+  "task_type": "navigate",
+  "action": "navigate_to",
+  "parameters": {
+    "destination": "office",
+    "speed": "normal"
+  }
+}
